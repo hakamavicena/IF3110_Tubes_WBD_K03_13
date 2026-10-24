@@ -1,6 +1,7 @@
 package main
 
 import (
+	"backend/accesscontrol"
 	"backend/auth"
 	"database/sql"
 	"fmt"
@@ -32,21 +33,16 @@ func main() {
 		log.Fatal("Database tidak dapat dihubungi:", err)
 	}
 
-	// Inisialisasi komponen Auth dengan PostgreSQL Repository
-	repo := auth.NewPostgresRepository(db)
-	service := auth.NewAuthService(repo)
-	handler := auth.NewAuthHandler(service)
+	authRepo := auth.NewPostgresRepository(db)
+	authService := auth.NewAuthService(authRepo)
+	authHandler := auth.NewAuthHandler(authService)
+	accessRepo := accesscontrol.NewPostgresRepository(db)
+	accessService := accesscontrol.NewAccessService(accessRepo)
+	adminHandler := accesscontrol.NewAdminHandler(accessService, accessRepo)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/login", handler.LoginHandler)
+	mux.HandleFunc("/login", authHandler.LoginHandler)
 
-	// protectedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	// 	session := r.Context().Value(auth.SessionContextKey).(*auth.Session)
-	// 	w.Write([]byte(fmt.Sprintf("Akses aman! User ID: %d", session.UserID)))
-	// })
-
-	// mux.Handle("/protected", handler.AuthMiddleware(protectedHandler))
-	// Handler untuk halaman dashboard
 	dashboardHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		session := r.Context().Value(auth.SessionContextKey).(*auth.Session)
 
@@ -56,11 +52,20 @@ func main() {
 			return
 		}
 
-		tmpl.Execute(w, session)
+		if err := tmpl.Execute(w, session); err != nil {
+			http.Error(w, "Gagal merender template", http.StatusInternalServerError)
+		}
 	})
 
-	mux.Handle("/dashboard", handler.AuthMiddleware(dashboardHandler))
-	mux.HandleFunc("/logout", handler.LogoutHandler) // Bisa juga dibungkus CSRFMiddleware jika diperlukan
+	mux.Handle("/dashboard", authHandler.AuthMiddleware(dashboardHandler))
+	mux.HandleFunc("/logout", authHandler.LogoutHandler)
+
+	admin := func(next http.HandlerFunc) http.Handler {
+		return authHandler.AuthMiddleware(http.HandlerFunc(accesscontrol.RequireAdmin(accessService, next)))
+	}
+	mux.Handle("/admin/users/groups", admin(adminHandler.AddUserToGroup))
+	mux.Handle("/admin/groups/access", admin(adminHandler.SetGroupAccess))
+	mux.Handle("/admin/databases", admin(adminHandler.CreateDatabaseConnection))
 
 	fmt.Println("Server berjalan di port 8080...")
 
@@ -76,7 +81,11 @@ func main() {
 			return
 		}
 
-		tmpl.Execute(w, nil)
+		if err := tmpl.Execute(w, nil); err != nil {
+			http.Error(w, "Gagal merender tampilan", http.StatusInternalServerError)
+		}
 	})
-	http.ListenAndServe(":8080", mux)
+	if err := http.ListenAndServe(":8080", mux); err != nil {
+		log.Fatal(err)
+	}
 }

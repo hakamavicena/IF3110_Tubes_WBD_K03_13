@@ -1,6 +1,7 @@
 package accesscontrol
 
 import (
+	"backend/auth"
 	"net/http"
 	"strconv"
 )
@@ -9,31 +10,24 @@ import (
 // butuh requiredLevel (misal AccessViewEdit kalo mau migrasi
 func RequireDBAccess(service *AccessService, requiredLevel AccessLevel, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// ini bagian auth, gw asumsikan ry ngelempar User ID lewat header 'X-User-ID' setelah dia ngecek session
-		// nti kalo ry kelar, tinggal samain cara ngambil userID-nya
-		userIDStr := r.Header.Get("X-User-ID") 
-
-		if userIDStr == "" {
-			ctxUserID := r.Context().Value("userID")
-			if ctxUserID != nil {
-				userIDStr = ctxUserID.(string)
-			}
-		}
-
-		userID, err := strconv.Atoi(userIDStr)
-		if err != nil {
-			http.Error(w, "Unauthorized: Invalid User ID", http.StatusUnauthorized)
+		session, ok := r.Context().Value(auth.SessionContextKey).(*auth.Session)
+		if !ok || session == nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		// asumsi nangkep ID database 
 		dbIDStr := r.URL.Query().Get("db_id")
 		if dbIDStr == "" {
 			http.Error(w, "Bad Request: db_id is required", http.StatusBadRequest)
 			return
 		}
-		dbID, _ := strconv.Atoi(dbIDStr)
-		effectiveAccess, err := service.GetEffectiveAccess(userID, dbID)
+		dbID, err := strconv.Atoi(dbIDStr)
+		if err != nil || dbID <= 0 {
+			http.Error(w, "Bad Request: invalid db_id", http.StatusBadRequest)
+			return
+		}
+
+		effectiveAccess, err := service.GetEffectiveAccess(session.UserID, dbID)
 		if err != nil || effectiveAccess < requiredLevel {
 			http.Error(w, "Forbidden: Insufficient Access", http.StatusForbidden)
 			return
@@ -44,14 +38,12 @@ func RequireDBAccess(service *AccessService, requiredLevel AccessLevel, next htt
 
 func RequireAdmin(service *AccessService, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// sama kayak di atas, nunggu userID dari auth 
-		userIDStr := r.Header.Get("X-User-ID")
-		userID, err := strconv.Atoi(userIDStr)
-		if err != nil {
+		session, ok := r.Context().Value(auth.SessionContextKey).(*auth.Session)
+		if !ok || session == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		if err := service.RequirePlatformAdmin(userID); err != nil {
+		if err := service.RequirePlatformAdmin(session.UserID); err != nil {
 			http.Error(w, "Forbidden: Platform Admin only", http.StatusForbidden)
 			return
 		}

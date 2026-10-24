@@ -14,7 +14,7 @@ const (
 type User struct {
 	ID       int    `json:"id"`
 	Username string `json:"username"` // asumsi dari auth
-	IsAdmin  bool   `json:"is_admin"` 
+	IsAdmin  bool   `json:"is_admin"`
 }
 
 type Group struct {
@@ -28,7 +28,7 @@ type Database struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
 	User     string `json:"user"`
-	Password string `json:"-"` 
+	Password string `json:"-"`
 	DBName   string `json:"db_name"`
 }
 
