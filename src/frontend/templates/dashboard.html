@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <title>Dashboard</title>
+</head>
+<body>
+    <h2>Selamat Datang di Aplikasi Database Management</h2>
+    <p>Anda login sebagai User ID: <strong>{{ .UserID }}</strong></p>
+    
+    <form action="/logout" method="POST">
+        <!-- Menggunakan POST untuk keamanan, mencegah pre-fetching memicu logout -->
+        <button type="submit">Logout</button>
+    </form>
+</body>
+</html>

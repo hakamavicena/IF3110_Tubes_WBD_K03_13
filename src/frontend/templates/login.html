@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <title>Login - Database Management</title>
+</head>
+<body>
+    <h2>Welcome to App</h2>
+    <form id="loginForm">
+        <label for="username">Username:</label><br>
+        <input type="text" id="username" required><br><br>
+        
+        <label for="password">Password:</label><br>
+        <input type="password" id="password" required><br><br>
+        
+        <button type="submit">Masuk</button>
+    </form>
+    <p id="message" style="color: red;"></p>
+
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+
+            const response = await fetch('/login', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest' // Syarat proteksi CSRF
+                },
+                body: JSON.stringify({ username, password })
+            });
+
+            if (response.ok) {
+                window.location.href = '/dashboard'; // Pindah halaman bila sukses
+            } else {
+                document.getElementById('message').innerText = 'Kredensial tidak valid.';
+            }
+        });
+    </script>
+</body>
+</html>
