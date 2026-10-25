@@ -69,7 +69,6 @@ func main() {
 		}
 	}
 
-	// 1. Inisialisasi koneksi SQL standar (Modul A & C)
 	db, err := sql.Open("postgres", internalDBURL)
 	if err != nil {
 		log.Fatalf("Gagal membuka koneksi database: %v", err)
@@ -79,7 +78,6 @@ func main() {
 		log.Fatalf("Database internal tidak dapat dihubungi via sql.DB: %v", err)
 	}
 
-	// 2. Inisialisasi pgxpool (Modul B: viewer & migration)
 	ctx := context.Background()
 	pgxPool, err := pgxpool.New(ctx, internalDBURL)
 	if err != nil {
@@ -92,7 +90,6 @@ func main() {
 		log.Fatalf("Database internal tidak dapat dihubungi via pgxpool: %v", err)
 	}
 
-	// 3. Baca dan inisialisasi SECRET_KEY untuk enkripsi AES-256-GCM target DB
 	secretKeyBase64 := os.Getenv("SECRET_KEY")
 	if secretKeyBase64 == "" {
 		log.Fatal("SECRET_KEY environment variable is required (base64 encoded 32 bytes)")
@@ -106,7 +103,6 @@ func main() {
 		log.Fatalf("Gagal inisialisasi secret box: %v", err)
 	}
 
-	// 4. Susun service modul A, C, dan B
 	authRepo := auth.NewPostgresRepository(db)
 	authConfig := auth.DefaultAuthConfig()
 	authService := auth.NewAuthService(authRepo, authConfig)
@@ -125,7 +121,6 @@ func main() {
 		return authService.InvalidateUserSessions(userID)
 	})
 
-	// Bootstrap Admin jika belum ada akun admin di database
 	adminCount, err := accessRepo.GetActiveAdminCount()
 	if err != nil {
 		log.Fatalf("Gagal memeriksa status admin di database: %v", err)
@@ -160,7 +155,6 @@ func main() {
 	migExecutor := &migration.Executor{StatementTimeout: timeout}
 	migService := migration.NewService(migRepo, authorizer, targetManager, migExecutor, timeout)
 
-	// Pemulihan migration yang stuck saat startup
 	recoverCtx, cancelRecover := context.WithTimeout(ctx, 10*time.Second)
 	recovered, err := migRepo.RecoverStuck(recoverCtx)
 	cancelRecover()
@@ -181,11 +175,9 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Rute Publik & Autentikasi
 	mux.HandleFunc("/login", authHandler.LoginHandler)
 	mux.HandleFunc("/logout", authHandler.LogoutHandler)
 
-	// Rute Dashboard
 	dashboardHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		session, ok := r.Context().Value(auth.SessionContextKey).(*auth.Session)
 		if !ok || session == nil {
@@ -231,7 +223,6 @@ func main() {
 	})
 	mux.Handle("/dashboard", authHandler.AuthMiddleware(dashboardHandler))
 
-	// Rute Admin (khusus Platform Admin)
 	adminGet := func(next http.HandlerFunc) http.Handler {
 		return authHandler.AuthMiddleware(http.HandlerFunc(accesscontrol.RequireAdmin(accessService, next)))
 	}
@@ -249,7 +240,6 @@ func main() {
 	mux.Handle("/admin/databases", adminPost(adminHandler.CreateDatabaseConnection))
 	mux.Handle("/admin/databases/delete", adminPost(adminHandler.DeleteDatabaseConnection))
 
-	// Rute Database Engine (Viewer & Migration) dari modul B
 	protectDB := func(next http.Handler) http.Handler {
 		return authHandler.AuthMiddleware(auth.CSRFMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			userID, ok := auth.UserIDFromContext(r.Context())
@@ -262,7 +252,6 @@ func main() {
 	}
 	httpdbHandler.Register(mux, protectDB)
 
-	// Rute Root (Halaman Login)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
