@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hakamavicena/if3110-dbengine/internal/apperr"
+	"github.com/hakamavicena/if3110-dbengine/pkg/apperr"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 

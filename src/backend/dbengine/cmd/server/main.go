@@ -17,11 +17,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hakamavicena/if3110-dbengine/internal/dbtarget"
-	"github.com/hakamavicena/if3110-dbengine/internal/dbviewer"
-	"github.com/hakamavicena/if3110-dbengine/internal/httpdb"
-	"github.com/hakamavicena/if3110-dbengine/internal/migration"
-	"github.com/hakamavicena/if3110-dbengine/internal/ports"
+	"github.com/hakamavicena/if3110-dbengine/pkg/dbtarget"
+	"github.com/hakamavicena/if3110-dbengine/pkg/dbviewer"
+	"github.com/hakamavicena/if3110-dbengine/pkg/httpdb"
+	"github.com/hakamavicena/if3110-dbengine/pkg/migration"
+	"github.com/hakamavicena/if3110-dbengine/pkg/ports"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 

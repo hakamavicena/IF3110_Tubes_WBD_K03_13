@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hakamavicena/if3110-dbengine/internal/testpg"
+	"github.com/hakamavicena/if3110-dbengine/pkg/testpg"
 )
 
 func TestExecutorCommitsWholeMigration(t *testing.T) {

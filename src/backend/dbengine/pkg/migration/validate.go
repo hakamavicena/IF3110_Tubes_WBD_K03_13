@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/hakamavicena/if3110-dbengine/internal/apperr"
+	"github.com/hakamavicena/if3110-dbengine/pkg/apperr"
 )
 
 const maxSQLBytes = 1 << 20

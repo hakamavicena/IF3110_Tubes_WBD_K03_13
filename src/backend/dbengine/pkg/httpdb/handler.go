@@ -12,10 +12,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/hakamavicena/if3110-dbengine/internal/apperr"
-	"github.com/hakamavicena/if3110-dbengine/internal/dbviewer"
-	"github.com/hakamavicena/if3110-dbengine/internal/migration"
-	"github.com/hakamavicena/if3110-dbengine/internal/ports"
+	"github.com/hakamavicena/if3110-dbengine/pkg/apperr"
+	"github.com/hakamavicena/if3110-dbengine/pkg/dbviewer"
+	"github.com/hakamavicena/if3110-dbengine/pkg/migration"
+	"github.com/hakamavicena/if3110-dbengine/pkg/ports"
 )
 
 //go:embed templates/*.html

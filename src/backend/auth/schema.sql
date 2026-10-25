@@ -35,19 +35,21 @@ CREATE TABLE user_groups (
     PRIMARY KEY (user_id, group_id)
 );
 
-CREATE TABLE databases (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(100) UNIQUE NOT NULL,
-    host VARCHAR(255) NOT NULL,
-    port INT NOT NULL,
-    db_user VARCHAR(100) NOT NULL,
-    db_password TEXT NOT NULL,
-    db_name VARCHAR(100) NOT NULL
+CREATE TABLE database_targets (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    host TEXT NOT NULL,
+    port INT NOT NULL DEFAULT 5432,
+    database_name TEXT NOT NULL,
+    username TEXT NOT NULL,
+    password_enc BYTEA NOT NULL,
+    ssl_mode TEXT NOT NULL DEFAULT 'prefer',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE group_database_access (
     group_id INT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-    database_id INT NOT NULL REFERENCES databases(id) ON DELETE CASCADE,
+    database_id BIGINT NOT NULL REFERENCES database_targets(id) ON DELETE CASCADE,
     access_level INT NOT NULL CHECK (access_level BETWEEN 0 AND 2),
     PRIMARY KEY (group_id, database_id)
 );
