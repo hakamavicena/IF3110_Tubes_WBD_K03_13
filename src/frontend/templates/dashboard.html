@@ -2,15 +2,39 @@
 <html lang="id">
 <head>
     <meta charset="UTF-8">
-    <title>Dashboard</title>
+    <title>Dashboard - Database Management</title>
 </head>
 <body>
-    <h2>Selamat Datang di Aplikasi Database Management</h2>
-    <p>Anda login sebagai User ID: <strong>{{ .UserID }}</strong></p>
-    
-    <form action="/logout" method="POST">
-        <!-- Menggunakan POST untuk keamanan, mencegah pre-fetching memicu logout -->
-        <button type="submit">Logout</button>
-    </form>
+    <header>
+        <h2>Selamat Datang di Platform Manajemen Database</h2>
+        <p>Login sebagai User ID: <strong>{{ .UserID }}</strong>{{ if .IsAdmin }} <span style="color: blue;">[Platform Admin]</span>{{ end }}</p>
+        <nav>
+            <a href="/databases">Pilih Database</a> |
+            {{ if .IsAdmin }}
+            <a href="/admin/databases">Kelola Koneksi DB (Admin)</a> |
+            <a href="/admin/users/groups">Kelola User Group (Admin)</a> |
+            <a href="/admin/groups/access">Kelola Hak Akses (Admin)</a> |
+            {{ end }}
+            <form action="/logout" method="POST" style="display:inline;">
+                <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+                <button type="submit">Logout</button>
+            </form>
+        </nav>
+    </header>
+    <hr>
+    <main>
+        <h3>Database yang Dapat Anda Akses</h3>
+        <ul>
+            {{ range .Databases }}
+            <li>
+                <strong>{{ .Name }}</strong> (Level: {{ if eq .Level 2 }}View + Edit{{ else if eq .Level 1 }}View Only{{ else }}None{{ end }})
+                — <a href="/databases/{{ .DatabaseID }}">Lihat Schema & Data</a>
+                — <a href="/databases/{{ .DatabaseID }}/migrations">Riwayat Migration</a>
+            </li>
+            {{ else }}
+            <li>Tidak ada database yang dapat Anda akses. Hubungi Platform Admin untuk memberikan akses grup ke database.</li>
+            {{ end }}
+        </ul>
+    </main>
 </body>
 </html>
