@@ -8,6 +8,7 @@ type User struct {
 	Username string `json:"username"`
 	Password string `json:"-"` // Hanya menyimpan password yang sudah di-hash
 	IsAdmin  bool   `json:"is_admin"`
+	IsActive bool   `json:"is_active"`
 }
 
 // Session merepresentasikan data sesi login yang disimpan di backend

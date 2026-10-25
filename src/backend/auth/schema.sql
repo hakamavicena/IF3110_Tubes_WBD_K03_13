@@ -13,8 +13,11 @@ CREATE TABLE users (
     id            BIGSERIAL PRIMARY KEY,
     username      VARCHAR(50) UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
-    is_admin      BOOLEAN NOT NULL DEFAULT FALSE
+    is_admin      BOOLEAN NOT NULL DEFAULT FALSE,
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE
 );
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+
 
 CREATE TABLE sessions (
     session_id          TEXT PRIMARY KEY,
@@ -75,7 +78,5 @@ CREATE TABLE migrations (
 
 CREATE INDEX IF NOT EXISTS idx_migrations_db ON migrations(database_id, version);
 
--- Seed awal akun admin
-INSERT INTO users (username, password_hash, is_admin)
-VALUES ('admin', '$2a$12$m/iwaqxYV/lXODTazaSZP.UN7EISVMnIvnzWnlfB5FMmCxELQGv.q', TRUE)
-ON CONFLICT (username) DO NOTHING;
+
+

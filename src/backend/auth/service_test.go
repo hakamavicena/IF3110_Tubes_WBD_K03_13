@@ -33,6 +33,7 @@ func TestLogin_Scenarios(t *testing.T) {
 		ID:       1,
 		Username: "admin",
 		Password: string(hashedPassword),
+		IsActive: true,
 	}
 
 	// 1a. Login Sukses
@@ -109,7 +110,7 @@ func TestSession_IdleTimeout(t *testing.T) {
 	service.SetNowFunc(func() time.Time { return currentTime })
 
 	hashed, _ := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.DefaultCost)
-	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed)}
+	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed), IsActive: true}
 
 	sess, err := service.Login("user1", "pass")
 	if err != nil {
@@ -150,7 +151,7 @@ func TestSession_AbsoluteExpiration(t *testing.T) {
 	service.SetNowFunc(func() time.Time { return currentTime })
 
 	hashed, _ := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.DefaultCost)
-	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed)}
+	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed), IsActive: true}
 
 	sess, err := service.Login("user1", "pass")
 	if err != nil {
@@ -186,7 +187,7 @@ func TestSession_RotationOnLogin(t *testing.T) {
 	service, repo := setupTestService(cfg)
 
 	hashed, _ := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.DefaultCost)
-	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed)}
+	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed), IsActive: true}
 
 	handler := NewAuthHandler(service)
 
@@ -239,7 +240,7 @@ func TestSession_PeriodicRotationAndPreservation(t *testing.T) {
 	service.SetNowFunc(func() time.Time { return currentTime })
 
 	hashed, _ := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.DefaultCost)
-	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed)}
+	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed), IsActive: true}
 
 	sess, err := service.Login("user1", "pass")
 	if err != nil {
@@ -292,7 +293,7 @@ func TestSession_GracePeriod(t *testing.T) {
 	service.SetNowFunc(func() time.Time { return currentTime })
 
 	hashed, _ := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.DefaultCost)
-	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed)}
+	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed), IsActive: true}
 
 	sess, _ := service.Login("user1", "pass")
 	oldID := sess.SessionID
@@ -337,7 +338,7 @@ func TestSession_Logout(t *testing.T) {
 	service, repo := setupTestService(cfg)
 
 	hashed, _ := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.DefaultCost)
-	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed)}
+	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed), IsActive: true}
 
 	sess, err := service.Login("user1", "pass")
 	if err != nil {
@@ -386,8 +387,8 @@ func TestSession_InvalidateUserSessions(t *testing.T) {
 	service, repo := setupTestService(cfg)
 
 	hashed, _ := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.DefaultCost)
-	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed)}
-	repo.Users["user2"] = &User{ID: 20, Username: "user2", Password: string(hashed)}
+	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed), IsActive: true}
+	repo.Users["user2"] = &User{ID: 20, Username: "user2", Password: string(hashed), IsActive: true}
 
 	s1, _ := service.Login("user1", "pass")
 	s2, _ := service.Login("user1", "pass")
@@ -415,7 +416,7 @@ func TestCSRFMiddleware(t *testing.T) {
 	handler := NewAuthHandler(service)
 
 	hashed, _ := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.DefaultCost)
-	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed)}
+	repo.Users["user1"] = &User{ID: 10, Username: "user1", Password: string(hashed), IsActive: true}
 
 	sess, _ := service.Login("user1", "pass")
 
@@ -486,7 +487,7 @@ func TestCookieFlags_DevVsProduction(t *testing.T) {
 	}
 	devService, devRepo := setupTestService(devCfg)
 	hashed, _ := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.DefaultCost)
-	devRepo.Users["devuser"] = &User{ID: 1, Username: "devuser", Password: string(hashed)}
+	devRepo.Users["devuser"] = &User{ID: 1, Username: "devuser", Password: string(hashed), IsActive: true}
 	devHandler := NewAuthHandler(devService)
 
 	reqDev := httptest.NewRequest("POST", "/login", strings.NewReader(`{"username":"devuser","password":"pass"}`))
@@ -512,7 +513,7 @@ func TestCookieFlags_DevVsProduction(t *testing.T) {
 		SecureCookie: true,
 	}
 	prodService, prodRepo := setupTestService(prodCfg)
-	prodRepo.Users["produser"] = &User{ID: 2, Username: "produser", Password: string(hashed)}
+	prodRepo.Users["produser"] = &User{ID: 2, Username: "produser", Password: string(hashed), IsActive: true}
 	prodHandler := NewAuthHandler(prodService)
 
 	reqProd := httptest.NewRequest("POST", "/login", strings.NewReader(`{"username":"produser","password":"pass"}`))
@@ -545,7 +546,7 @@ func TestLog_NoSensitiveDataLeaked(t *testing.T) {
 
 	passwordPlain := "sensitive_super_secret_pw"
 	hashed, _ := bcrypt.GenerateFromPassword([]byte(passwordPlain), bcrypt.DefaultCost)
-	repo.Users["testuser"] = &User{ID: 1, Username: "testuser", Password: string(hashed)}
+	repo.Users["testuser"] = &User{ID: 1, Username: "testuser", Password: string(hashed), IsActive: true}
 
 	// Login Sukses
 	reqSuccess := httptest.NewRequest("POST", "/login", strings.NewReader(fmt.Sprintf(`{"username":"testuser","password":"%s"}`, passwordPlain)))
@@ -582,7 +583,7 @@ func TestResponseBody_NoSessionIDLeaked(t *testing.T) {
 	handler := NewAuthHandler(service)
 
 	hashed, _ := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.DefaultCost)
-	repo.Users["testuser"] = &User{ID: 1, Username: "testuser", Password: string(hashed)}
+	repo.Users["testuser"] = &User{ID: 1, Username: "testuser", Password: string(hashed), IsActive: true}
 
 	// Login
 	sess, err := service.Login("testuser", "pass")
@@ -609,5 +610,36 @@ func TestResponseBody_NoSessionIDLeaked(t *testing.T) {
 	}
 	if !strings.Contains(body, sess.CSRFToken) {
 		t.Errorf("Expected CSRF token to be rendered in form, but not found in body: %s", body)
+	}
+}
+
+// 16. Test User Nonaktif (Tugas 1f)
+func TestUser_InactiveRejection(t *testing.T) {
+	cfg := DefaultAuthConfig()
+	service, repo := setupTestService(cfg)
+
+	hashed, _ := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.DefaultCost)
+	// User aktif
+	repo.Users["active_user"] = &User{ID: 100, Username: "active_user", Password: string(hashed), IsActive: true}
+	// User nonaktif
+	repo.Users["inactive_user"] = &User{ID: 101, Username: "inactive_user", Password: string(hashed), IsActive: false}
+
+	// 1. User nonaktif login -> ditolak ErrInvalidCredentials
+	_, err := service.Login("inactive_user", "pass")
+	if err != ErrInvalidCredentials {
+		t.Errorf("Expected ErrInvalidCredentials for inactive user login, got %v", err)
+	}
+
+	// 2. User aktif login -> sukses
+	sess, err := service.Login("active_user", "pass")
+	if err != nil {
+		t.Fatalf("Login failed for active user: %v", err)
+	}
+
+	// 3. User dinonaktifkan -> request session berikutnya ditolak ErrSessionExpired
+	repo.Users["active_user"].IsActive = false
+	_, _, err = service.ValidateAndRotateSession(sess.SessionID)
+	if err != ErrSessionExpired {
+		t.Errorf("Expected ErrSessionExpired when user is deactivated, got %v", err)
 	}
 }

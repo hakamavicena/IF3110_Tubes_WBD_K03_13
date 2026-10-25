@@ -21,6 +21,9 @@ func TestPostgresRepository_Integration(t *testing.T) {
 	}
 	connStr := os.Getenv("INTERNAL_DB_URL")
 	if connStr == "" {
+		connStr = os.Getenv("TEST_PG_ADMIN_URL")
+	}
+	if connStr == "" {
 		host := os.Getenv("DB_HOST")
 		if host == "" {
 			host = "localhost"
@@ -29,8 +32,13 @@ func TestPostgresRepository_Integration(t *testing.T) {
 		if port == "" {
 			port = "5433"
 		}
+		user := os.Getenv("DB_USER")
+		if user == "" {
+			t.Skip("Skipping integration test: INTERNAL_DB_URL / TEST_PG_ADMIN_URL not set")
+			return
+		}
 		connStr = fmt.Sprintf("user=%s password=%s host=%s port=%s dbname=%s sslmode=disable",
-			os.Getenv("DB_USER"),
+			user,
 			os.Getenv("DB_PASSWORD"),
 			host,
 			port,
@@ -42,6 +50,10 @@ func TestPostgresRepository_Integration(t *testing.T) {
 		t.Fatalf("Gagal koneksi ke DB Test: %v", err)
 	}
 	defer db.Close()
+	if err := db.Ping(); err != nil {
+		t.Skipf("Cannot ping test database (%v), skipping", err)
+		return
+	}
 
 	repo := NewPostgresRepository(db)
 

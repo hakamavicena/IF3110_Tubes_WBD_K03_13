@@ -19,6 +19,15 @@ func (m *MockRepository) GetUserByUsername(username string) (*User, error) {
 	return nil, ErrUserNotFound
 }
 
+func (m *MockRepository) GetUserByID(id int) (*User, error) {
+	for _, u := range m.Users {
+		if u.ID == id {
+			return u, nil
+		}
+	}
+	return nil, ErrUserNotFound
+}
+
 func (m *MockRepository) SaveSession(session *Session) error {
 	m.Sessions[session.SessionID] = session
 	return nil

@@ -17,8 +17,18 @@ func NewPostgresRepository(db *sql.DB) *PostgresRepository {
 
 func (r *PostgresRepository) GetUserByUsername(username string) (*User, error) {
 	user := &User{}
-	query := `SELECT id, username, password_hash, is_admin FROM users WHERE username = $1`
-	err := r.db.QueryRow(query, username).Scan(&user.ID, &user.Username, &user.Password, &user.IsAdmin)
+	query := `SELECT id, username, password_hash, is_admin, is_active FROM users WHERE username = $1`
+	err := r.db.QueryRow(query, username).Scan(&user.ID, &user.Username, &user.Password, &user.IsAdmin, &user.IsActive)
+	if err == sql.ErrNoRows {
+		return nil, ErrUserNotFound
+	}
+	return user, err
+}
+
+func (r *PostgresRepository) GetUserByID(id int) (*User, error) {
+	user := &User{}
+	query := `SELECT id, username, password_hash, is_admin, is_active FROM users WHERE id = $1`
+	err := r.db.QueryRow(query, id).Scan(&user.ID, &user.Username, &user.Password, &user.IsAdmin, &user.IsActive)
 	if err == sql.ErrNoRows {
 		return nil, ErrUserNotFound
 	}

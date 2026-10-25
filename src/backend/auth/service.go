@@ -99,6 +99,10 @@ func (s *AuthService) Login(username, password string) (*Session, error) {
 		return nil, ErrInvalidCredentials
 	}
 
+	if !user.IsActive {
+		return nil, ErrInvalidCredentials
+	}
+
 	sessID, err := GenerateRandomToken(32)
 	if err != nil {
 		return nil, err
@@ -129,6 +133,13 @@ func (s *AuthService) ValidateAndRotateSession(sessionID string) (*Session, stri
 	session, err := s.repo.GetSession(sessionID)
 	if err != nil {
 		return nil, "", err
+	}
+
+	// 0. Periksa status keaktifan user (menolak session user nonaktif)
+	user, err := s.repo.GetUserByID(session.UserID)
+	if err != nil || !user.IsActive {
+		_ = s.repo.DeleteSession(session.SessionID)
+		return nil, "", ErrSessionExpired
 	}
 
 	now := s.now()
