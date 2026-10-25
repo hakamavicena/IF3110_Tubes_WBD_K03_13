@@ -1,0 +1,6 @@
+<!doctype html>
+<html lang="id"><meta charset="utf-8"><title>Migration</title>
+<body><h1>Riwayat migration</h1>{{if .CanEdit}}<p><a href="/databases/{{.DBID}}/migrations/new">Buat migration</a></p>{{end}}
+<table><tr><th>Versi</th><th>Judul</th><th>Status</th><th>Dibuat</th></tr>
+{{range .Migrations}}<tr><td>{{.Version}}</td><td><a href="/databases/{{$.DBID}}/migrations/{{.ID}}">{{.Title}}</a></td><td>{{.Status}}</td><td>{{.CreatedAt}}</td></tr>{{else}}<tr><td colspan="4">Belum ada migration.</td></tr>{{end}}
+</table></body></html>

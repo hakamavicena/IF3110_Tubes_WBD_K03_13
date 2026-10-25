@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="id"><meta charset="utf-8"><title>Data tabel</title>
+<body><h1>Data {{.Schema}}.{{.Table}}</h1><p>Total baris: {{.Data.Total}}</p>
+<table><thead><tr>{{range .Data.Columns}}<th>{{.}}</th>{{end}}</tr></thead><tbody>
+{{range .Data.Rows}}<tr>{{range .}}<td>{{if .}}{{.}}{{else}}<em>NULL</em>{{end}}</td>{{end}}</tr>{{else}}<tr><td colspan="{{len .Data.Columns}}">Tidak ada data pada halaman ini.</td></tr>{{end}}
+</tbody></table>
+<nav>{{if gt .Data.Page 1}}<a href="?page={{sub .Data.Page 1}}">Sebelumnya</a>{{end}}
+{{if lt .Data.Page .Data.Pages}}<a href="?page={{add .Data.Page 1}}">Berikutnya</a>{{end}}</nav>
+</body></html>

@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="id"><meta charset="utf-8"><title>{{if .Editing}}Edit{{else}}Buat{{end}} migration</title>
+<body><h1>{{if .Editing}}Edit{{else}}Buat{{end}} migration</h1>
+{{if .Error}}<p role="alert">{{.Error}}</p>{{end}}
+<form method="post" action="{{if .Editing}}/databases/{{.DBID}}/migrations/{{.Migration.ID}}{{else}}/databases/{{.DBID}}/migrations{{end}}">
+<input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+<label>Judul <input name="title" maxlength="200" required value="{{.Title}}"></label>
+<label>SQL <textarea name="sql" required>{{.SQL}}</textarea></label>
+<button type="submit">Simpan draft</button></form></body></html>

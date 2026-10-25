@@ -1,0 +1,5 @@
+<!doctype html>
+<html lang="id"><meta charset="utf-8"><title>Schema</title>
+<body><h1>Schema</h1><a href="/databases/{{.DBID}}/migrations">Riwayat migration</a><ul>
+{{range .Schemas}}<li><a href="/databases/{{$.DBID}}/schemas/{{path .}}/tables">{{.}}</a></li>{{else}}<li>Tidak ada schema.</li>{{end}}
+</ul></body></html>

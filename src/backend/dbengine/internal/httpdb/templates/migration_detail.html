@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="id"><meta charset="utf-8"><title>Detail migration</title>
+<body><h1>Migration v{{.Migration.Version}}: {{.Migration.Title}}</h1>
+<p>Status: {{.Migration.Status}}</p>
+<p>Dibuat oleh {{.Migration.CreatedByName}} pada {{.Migration.CreatedAt}}</p>
+{{if .Migration.ExecutedByName}}<p>Dijalankan oleh {{.Migration.ExecutedByName}} pada {{.Migration.ExecutedAt}} ({{.Migration.DurationMs}} ms)</p>{{end}}
+{{if .Migration.ErrorMessage}}<p role="alert">{{.Migration.ErrorMessage}}</p>{{end}}
+<h2>SQL</h2><pre>{{.Migration.SQL}}</pre>
+{{if and .CanEdit (or (eq .Migration.Status "draft") (eq .Migration.Status "failed"))}}
+<a href="/databases/{{.DBID}}/migrations/{{.Migration.ID}}/edit">Edit</a>
+<form method="post" action="/databases/{{.DBID}}/migrations/{{.Migration.ID}}/execute" onsubmit="return confirm('Jalankan migration ini?')">
+<input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button type="submit">Jalankan</button></form>{{end}}
+</body></html>

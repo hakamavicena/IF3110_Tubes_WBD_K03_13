@@ -1,0 +1,5 @@
+<!doctype html>
+<html lang="id"><meta charset="utf-8"><title>Database</title>
+<body><h1>Database yang dapat diakses</h1><ul>
+{{range .Databases}}<li><a href="/databases/{{.DatabaseID}}">{{.Name}}</a> (akses {{.Level}})</li>{{else}}<li>Tidak ada database yang dapat diakses.</li>{{end}}
+</ul></body></html>

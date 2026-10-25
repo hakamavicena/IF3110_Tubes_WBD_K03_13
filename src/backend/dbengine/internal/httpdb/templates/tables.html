@@ -1,0 +1,5 @@
+<!doctype html>
+<html lang="id"><meta charset="utf-8"><title>Tabel</title>
+<body><h1>Tabel pada {{.Schema}}</h1><ul>
+{{range .Tables}}<li><a href="/databases/{{$.DBID}}/schemas/{{path .Schema}}/tables/{{path .Name}}">{{.Name}}</a> ({{.Type}})</li>{{else}}<li>Tidak ada tabel.</li>{{end}}
+</ul></body></html>

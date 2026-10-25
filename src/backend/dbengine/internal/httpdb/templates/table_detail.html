@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="id"><meta charset="utf-8"><title>Detail tabel</title>
+<body><h1>{{.Detail.Table.Schema}}.{{.Detail.Table.Name}}</h1>
+<p>{{.Detail.Table.Type}}</p>
+<p><a href="/databases/{{.DBID}}/schemas/{{path .Detail.Table.Schema}}/tables/{{path .Detail.Table.Name}}/data">Lihat data</a></p>
+<h2>Kolom</h2><table><tr><th>Posisi</th><th>Nama</th><th>Tipe</th><th>Nullable</th><th>Default</th></tr>
+{{range .Detail.Columns}}<tr><td>{{.Position}}</td><td>{{.Name}}</td><td>{{.DataType}}</td><td>{{.Nullable}}</td><td>{{if .Default}}{{.Default}}{{end}}</td></tr>{{else}}<tr><td colspan="5">Tidak ada kolom.</td></tr>{{end}}</table>
+<h2>Constraint</h2><ul>{{range .Detail.Constraints}}<li>{{.Type}} {{.Name}}: {{.Definition}}</li>{{else}}<li>Tidak ada constraint.</li>{{end}}</ul>
+<h2>Index</h2><ul>{{range .Detail.Indexes}}<li>{{.Name}}: {{.Definition}}</li>{{else}}<li>Tidak ada index.</li>{{end}}</ul>
+</body></html>
