@@ -23,13 +23,20 @@ type Group struct {
 }
 
 type Database struct {
-	ID       int    `json:"id"`
-	Name     string `json:"name"`
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	User     string `json:"user"`
-	Password string `json:"-"`
-	DBName   string `json:"db_name"`
+	ID           int    `json:"id"`
+	Name         string `json:"name"`
+	Host         string `json:"host"`
+	Port         int    `json:"port"`
+	DatabaseName string `json:"database_name"`
+	Username     string `json:"username"`
+	PasswordEnc  []byte `json:"-"`
+	SSLMode      string `json:"ssl_mode"`
+}
+
+type DatabaseWithAccess struct {
+	DatabaseID int64
+	Name       string
+	Level      AccessLevel
 }
 
 type GroupAccess struct {

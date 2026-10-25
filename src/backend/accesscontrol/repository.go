@@ -4,7 +4,7 @@ package accesscontrol
 type AccessRepository interface {
 	GetUser(userID int) (*User, error)
 	GetAllUsers() ([]User, error)
-	CreateUser(user *User) error 
+	CreateUser(user *User) error
 
 	GetGroup(groupID int) (*Group, error)
 	GetAllGroups() ([]Group, error)
@@ -20,4 +20,5 @@ type AccessRepository interface {
 
 	SetGroupAccess(groupID, databaseID int, level AccessLevel) error
 	GetAccessByGroupAndDB(groupID, databaseID int) (AccessLevel, error)
+	GetAccessibleDatabases(userID int) ([]DatabaseWithAccess, error)
 }

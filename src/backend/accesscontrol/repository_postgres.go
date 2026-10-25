@@ -116,8 +116,10 @@ func (r *postgresRepository) RemoveUserFromGroup(userID, groupID int) error {
 
 func (r *postgresRepository) GetDatabase(dbID int) (*Database, error) {
 	d := &Database{}
-	err := r.db.QueryRow("SELECT id, name, host, port, db_user, db_password, db_name FROM databases WHERE id = $1", dbID).
-		Scan(&d.ID, &d.Name, &d.Host, &d.Port, &d.User, &d.Password, &d.DBName)
+	err := r.db.QueryRow(`
+		SELECT id, name, host, port, database_name, username, password_enc, ssl_mode 
+		FROM database_targets WHERE id = $1
+	`, dbID).Scan(&d.ID, &d.Name, &d.Host, &d.Port, &d.DatabaseName, &d.Username, &d.PasswordEnc, &d.SSLMode)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -125,7 +127,11 @@ func (r *postgresRepository) GetDatabase(dbID int) (*Database, error) {
 }
 
 func (r *postgresRepository) GetAllDatabases() ([]Database, error) {
-	rows, err := r.db.Query("SELECT id, name, host, port, db_user, db_password, db_name FROM databases")
+	rows, err := r.db.Query(`
+		SELECT id, name, host, port, database_name, username, password_enc, ssl_mode 
+		FROM database_targets 
+		ORDER BY name ASC
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +140,7 @@ func (r *postgresRepository) GetAllDatabases() ([]Database, error) {
 	var dbs []Database
 	for rows.Next() {
 		var d Database
-		if err := rows.Scan(&d.ID, &d.Name, &d.Host, &d.Port, &d.User, &d.Password, &d.DBName); err != nil {
+		if err := rows.Scan(&d.ID, &d.Name, &d.Host, &d.Port, &d.DatabaseName, &d.Username, &d.PasswordEnc, &d.SSLMode); err != nil {
 			return nil, err
 		}
 		dbs = append(dbs, d)
@@ -143,10 +149,14 @@ func (r *postgresRepository) GetAllDatabases() ([]Database, error) {
 }
 
 func (r *postgresRepository) CreateDatabase(db *Database) error {
+	sslMode := db.SSLMode
+	if sslMode == "" {
+		sslMode = "prefer"
+	}
 	return r.db.QueryRow(`
-		INSERT INTO databases (name, host, port, db_user, db_password, db_name) 
-		VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
-	`, db.Name, db.Host, db.Port, db.User, db.Password, db.DBName).Scan(&db.ID)
+		INSERT INTO database_targets (name, host, port, database_name, username, password_enc, ssl_mode) 
+		VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
+	`, db.Name, db.Host, db.Port, db.DatabaseName, db.Username, db.PasswordEnc, sslMode).Scan(&db.ID)
 }
 
 func (r *postgresRepository) SetGroupAccess(groupID, databaseID int, level AccessLevel) error {
@@ -167,7 +177,36 @@ func (r *postgresRepository) GetAccessByGroupAndDB(groupID, databaseID int) (Acc
 		WHERE group_id = $1 AND database_id = $2
 	`, groupID, databaseID).Scan(&level)
 	if err == sql.ErrNoRows {
-		return AccessNone, nil 
+		return AccessNone, nil
 	}
 	return AccessLevel(level), err
+}
+
+func (r *postgresRepository) GetAccessibleDatabases(userID int) ([]DatabaseWithAccess, error) {
+	rows, err := r.db.Query(`
+		SELECT dt.id, dt.name, MAX(gda.access_level) as max_level
+		FROM database_targets dt
+		JOIN group_database_access gda ON dt.id = gda.database_id
+		JOIN user_groups ug ON gda.group_id = ug.group_id
+		WHERE ug.user_id = $1
+		GROUP BY dt.id, dt.name
+		HAVING MAX(gda.access_level) > 0
+		ORDER BY dt.name ASC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []DatabaseWithAccess
+	for rows.Next() {
+		var item DatabaseWithAccess
+		var lvl int
+		if err := rows.Scan(&item.DatabaseID, &item.Name, &lvl); err != nil {
+			return nil, err
+		}
+		item.Level = AccessLevel(lvl)
+		result = append(result, item)
+	}
+	return result, nil
 }

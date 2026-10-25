@@ -1,5 +1,10 @@
 package accesscontrol
 
+import (
+	"database/sql"
+	"errors"
+)
+
 type AccessService struct {
 	repo AccessRepository
 }
@@ -9,14 +14,9 @@ func NewAccessService(repo AccessRepository) *AccessService {
 }
 
 func (s *AccessService) GetEffectiveAccess(userID, dbID int) (AccessLevel, error) {
-	user, err := s.repo.GetUser(userID)
+	_, err := s.repo.GetUser(userID)
 	if err != nil {
 		return AccessNone, err
-	}
-
-	// admin punya akses penuh 
-	if user.IsAdmin {
-		return AccessViewEdit, nil
 	}
 
 	groups, err := s.repo.GetGroupsByUserID(userID)
@@ -27,10 +27,14 @@ func (s *AccessService) GetEffectiveAccess(userID, dbID int) (AccessLevel, error
 	effectiveAccess := AccessNone
 	for _, group := range groups {
 		level, err := s.repo.GetAccessByGroupAndDB(group.ID, dbID)
-		if err == nil {
-			if level > effectiveAccess {
-				effectiveAccess = level
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) || errors.Is(err, ErrNotFound) {
+				continue
 			}
+			return AccessNone, err
+		}
+		if level > effectiveAccess {
+			effectiveAccess = level
 		}
 	}
 
