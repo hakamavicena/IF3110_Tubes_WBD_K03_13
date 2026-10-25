@@ -1,3 +1,5 @@
+//go:build integration
+
 package auth
 
 import (
@@ -17,11 +19,24 @@ func TestPostgresRepository_Integration(t *testing.T) {
 	if err := godotenv.Load(); err != nil {
 		log.Println("Tidak ada file .env, menggunakan variabel environment OS")
 	}
-	connStr := fmt.Sprintf("user=%s password=%s dbname=%s sslmode=disable",
-		os.Getenv("DB_USER"),
-		os.Getenv("DB_PASSWORD"),
-		os.Getenv("DB_NAME"),
-	)
+	connStr := os.Getenv("INTERNAL_DB_URL")
+	if connStr == "" {
+		host := os.Getenv("DB_HOST")
+		if host == "" {
+			host = "localhost"
+		}
+		port := os.Getenv("DB_PORT")
+		if port == "" {
+			port = "5433"
+		}
+		connStr = fmt.Sprintf("user=%s password=%s host=%s port=%s dbname=%s sslmode=disable",
+			os.Getenv("DB_USER"),
+			os.Getenv("DB_PASSWORD"),
+			host,
+			port,
+			os.Getenv("DB_NAME"),
+		)
+	}
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		t.Fatalf("Gagal koneksi ke DB Test: %v", err)

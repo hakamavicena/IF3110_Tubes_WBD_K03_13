@@ -1,6 +1,5 @@
 package auth
 
-// MockRepository ini buat test aja, jadi sebenernya ga kepake
 type MockRepository struct {
 	Users    map[string]*User
 	Sessions map[string]*Session
@@ -29,10 +28,29 @@ func (m *MockRepository) GetSession(sessionID string) (*Session, error) {
 	if session, exists := m.Sessions[sessionID]; exists {
 		return session, nil
 	}
+	for _, s := range m.Sessions {
+		if s.PreviousID == sessionID {
+			return s, nil
+		}
+	}
 	return nil, ErrSessionNotFound
 }
 
 func (m *MockRepository) DeleteSession(sessionID string) error {
 	delete(m.Sessions, sessionID)
+	for id, s := range m.Sessions {
+		if s.PreviousID == sessionID {
+			delete(m.Sessions, id)
+		}
+	}
+	return nil
+}
+
+func (m *MockRepository) DeleteUserSessions(userID int) error {
+	for id, s := range m.Sessions {
+		if s.UserID == userID {
+			delete(m.Sessions, id)
+		}
+	}
 	return nil
 }
