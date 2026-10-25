@@ -80,6 +80,209 @@ func (f *fakeAccessRepo) GetAccessibleDatabases(userID int) ([]DatabaseWithAcces
 	return f.accessibleDBs[userID], nil
 }
 
+func (f *fakeAccessRepo) GetAllUsers() ([]User, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	var res []User
+	for _, u := range f.users {
+		res = append(res, *u)
+	}
+	return res, nil
+}
+
+func (f *fakeAccessRepo) CreateUser(user *User) error {
+	if f.failWith != nil {
+		return f.failWith
+	}
+	if user.ID == 0 {
+		user.ID = len(f.users) + 1
+	}
+	f.users[user.ID] = user
+	return nil
+}
+
+func (f *fakeAccessRepo) CreateUserWithPassword(username string, passwordHash string, isAdmin bool) (*User, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	u := &User{
+		ID:       len(f.users) + 1,
+		Username: username,
+		IsAdmin:  isAdmin,
+		IsActive: true,
+	}
+	f.users[u.ID] = u
+	return u, nil
+}
+
+func (f *fakeAccessRepo) SetUserActive(userID int, isActive bool) error {
+	if f.failWith != nil {
+		return f.failWith
+	}
+	u, ok := f.users[userID]
+	if !ok {
+		return ErrNotFound
+	}
+	u.IsActive = isActive
+	return nil
+}
+
+func (f *fakeAccessRepo) GetActiveAdminCount() (int, error) {
+	if f.failWith != nil {
+		return 0, f.failWith
+	}
+	count := 0
+	for _, u := range f.users {
+		if u.IsAdmin && u.IsActive {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (f *fakeAccessRepo) GetGroup(groupID int) (*Group, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	g, ok := f.groups[groupID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return g, nil
+}
+
+func (f *fakeAccessRepo) GetAllGroups() ([]Group, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	var res []Group
+	for _, g := range f.groups {
+		res = append(res, *g)
+	}
+	return res, nil
+}
+
+func (f *fakeAccessRepo) CreateGroup(name string) (*Group, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	g := &Group{
+		ID:   len(f.groups) + 1,
+		Name: name,
+	}
+	f.groups[g.ID] = g
+	return g, nil
+}
+
+func (f *fakeAccessRepo) AddUserToGroup(userID, groupID int) error {
+	if f.failWith != nil {
+		return f.failWith
+	}
+	f.userGroups[userID] = append(f.userGroups[userID], groupID)
+	return nil
+}
+
+func (f *fakeAccessRepo) RemoveUserFromGroup(userID, groupID int) error {
+	if f.failWith != nil {
+		return f.failWith
+	}
+	var updated []int
+	for _, gid := range f.userGroups[userID] {
+		if gid != groupID {
+			updated = append(updated, gid)
+		}
+	}
+	f.userGroups[userID] = updated
+	return nil
+}
+
+func (f *fakeAccessRepo) GetGroupMembers(groupID int) ([]User, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	var res []User
+	for uid, gids := range f.userGroups {
+		for _, gid := range gids {
+			if gid == groupID {
+				if u, ok := f.users[uid]; ok {
+					res = append(res, *u)
+				}
+				break
+			}
+		}
+	}
+	return res, nil
+}
+
+func (f *fakeAccessRepo) GetGroupGrants(groupID int) ([]GroupDatabaseGrant, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	var res []GroupDatabaseGrant
+	for key, lvl := range f.groupAccess {
+		var gid, dbid int
+		fmt.Sscanf(key, "%d:%d", &gid, &dbid)
+		if gid == groupID && lvl > 0 {
+			res = append(res, GroupDatabaseGrant{
+				DatabaseID:   dbid,
+				DatabaseName: fmt.Sprintf("db_%d", dbid),
+				AccessLevel:  lvl,
+			})
+		}
+	}
+	return res, nil
+}
+
+func (f *fakeAccessRepo) GetDatabase(dbID int) (*Database, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	return &Database{ID: dbID, Name: fmt.Sprintf("db_%d", dbID)}, nil
+}
+
+func (f *fakeAccessRepo) GetAllDatabases() ([]Database, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	return []Database{{ID: 1, Name: "db_1"}}, nil
+}
+
+func (f *fakeAccessRepo) CreateDatabase(db *Database) error {
+	if f.failWith != nil {
+		return f.failWith
+	}
+	if db.ID == 0 {
+		db.ID = 10
+	}
+	return nil
+}
+
+func (f *fakeAccessRepo) DeleteDatabase(dbID int) error {
+	if f.failWith != nil {
+		return f.failWith
+	}
+	return nil
+}
+
+func (f *fakeAccessRepo) SetGroupAccess(groupID, databaseID int, level AccessLevel) error {
+	if f.failWith != nil {
+		return f.failWith
+	}
+	key := fmt.Sprintf("%d:%d", groupID, databaseID)
+	f.groupAccess[key] = level
+	return nil
+}
+
+func (f *fakeAccessRepo) DeleteGroupAccess(groupID, databaseID int) error {
+	if f.failWith != nil {
+		return f.failWith
+	}
+	key := fmt.Sprintf("%d:%d", groupID, databaseID)
+	delete(f.groupAccess, key)
+	return nil
+}
+
 // 1. Admin tanpa group -> level None (CanView=false, CanEdit=false)
 func TestAdmin_WithoutGroup_HasNoDatabaseAccess(t *testing.T) {
 	repo := newFakeRepo()

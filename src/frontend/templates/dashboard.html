@@ -9,11 +9,10 @@
         <h2>Selamat Datang di Platform Manajemen Database</h2>
         <p>Login sebagai User ID: <strong>{{ .UserID }}</strong>{{ if .IsAdmin }} <span style="color: blue;">[Platform Admin]</span>{{ end }}</p>
         <nav>
-            <a href="/databases">Pilih Database</a> |
+            <a href="/dashboard">Dashboard</a> |
+            <a href="/databases">Database</a> |
             {{ if .IsAdmin }}
-            <a href="/admin/databases">Kelola Koneksi DB (Admin)</a> |
-            <a href="/admin/users/groups">Kelola User Group (Admin)</a> |
-            <a href="/admin/groups/access">Kelola Hak Akses (Admin)</a> |
+            <a href="/admin">Admin</a> |
             {{ end }}
             <form action="/logout" method="POST" style="display:inline;">
                 <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">

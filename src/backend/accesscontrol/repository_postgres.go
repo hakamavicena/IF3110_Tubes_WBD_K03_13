@@ -16,7 +16,7 @@ func NewPostgresRepository(db *sql.DB) AccessRepository {
 
 func (r *postgresRepository) GetUser(userID int) (*User, error) {
 	u := &User{}
-	err := r.db.QueryRow("SELECT id, username, is_admin FROM users WHERE id = $1", userID).Scan(&u.ID, &u.Username, &u.IsAdmin)
+	err := r.db.QueryRow("SELECT id, username, is_admin, is_active FROM users WHERE id = $1", userID).Scan(&u.ID, &u.Username, &u.IsAdmin, &u.IsActive)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -24,7 +24,7 @@ func (r *postgresRepository) GetUser(userID int) (*User, error) {
 }
 
 func (r *postgresRepository) GetAllUsers() ([]User, error) {
-	rows, err := r.db.Query("SELECT id, username, is_admin FROM users")
+	rows, err := r.db.Query("SELECT id, username, is_admin, is_active FROM users ORDER BY id ASC")
 	if err != nil {
 		return nil, err
 	}
@@ -33,7 +33,7 @@ func (r *postgresRepository) GetAllUsers() ([]User, error) {
 	var users []User
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Username, &u.IsAdmin); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.IsAdmin, &u.IsActive); err != nil {
 			return nil, err
 		}
 		users = append(users, u)
@@ -43,6 +43,34 @@ func (r *postgresRepository) GetAllUsers() ([]User, error) {
 
 func (r *postgresRepository) CreateUser(user *User) error {
 	return r.db.QueryRow("INSERT INTO users (username, is_admin) VALUES ($1, $2) RETURNING id", user.Username, user.IsAdmin).Scan(&user.ID)
+}
+
+func (r *postgresRepository) CreateUserWithPassword(username string, passwordHash string, isAdmin bool) (*User, error) {
+	u := &User{
+		Username: username,
+		IsAdmin:  isAdmin,
+		IsActive: true,
+	}
+	err := r.db.QueryRow(`
+		INSERT INTO users (username, password_hash, is_admin, is_active) 
+		VALUES ($1, $2, $3, true) 
+		RETURNING id
+	`, username, passwordHash, isAdmin).Scan(&u.ID)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+func (r *postgresRepository) SetUserActive(userID int, isActive bool) error {
+	_, err := r.db.Exec("UPDATE users SET is_active = $1 WHERE id = $2", isActive, userID)
+	return err
+}
+
+func (r *postgresRepository) GetActiveAdminCount() (int, error) {
+	var count int
+	err := r.db.QueryRow("SELECT COUNT(*) FROM users WHERE is_admin = true AND is_active = true").Scan(&count)
+	return count, err
 }
 
 func (r *postgresRepository) GetGroup(groupID int) (*Group, error) {
@@ -209,4 +237,64 @@ func (r *postgresRepository) GetAccessibleDatabases(userID int) ([]DatabaseWithA
 		result = append(result, item)
 	}
 	return result, nil
+}
+
+func (r *postgresRepository) DeleteDatabase(dbID int) error {
+	_, err := r.db.Exec("DELETE FROM database_targets WHERE id = $1", dbID)
+	return err
+}
+
+func (r *postgresRepository) DeleteGroupAccess(groupID, databaseID int) error {
+	_, err := r.db.Exec("DELETE FROM group_database_access WHERE group_id = $1 AND database_id = $2", groupID, databaseID)
+	return err
+}
+
+func (r *postgresRepository) GetGroupMembers(groupID int) ([]User, error) {
+	rows, err := r.db.Query(`
+		SELECT u.id, u.username, u.is_admin, u.is_active 
+		FROM users u
+		JOIN user_groups ug ON u.id = ug.user_id
+		WHERE ug.group_id = $1
+		ORDER BY u.id ASC
+	`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []User
+	for rows.Next() {
+		var u User
+		if err := rows.Scan(&u.ID, &u.Username, &u.IsAdmin, &u.IsActive); err != nil {
+			return nil, err
+		}
+		members = append(members, u)
+	}
+	return members, nil
+}
+
+func (r *postgresRepository) GetGroupGrants(groupID int) ([]GroupDatabaseGrant, error) {
+	rows, err := r.db.Query(`
+		SELECT dt.id, dt.name, gda.access_level
+		FROM group_database_access gda
+		JOIN database_targets dt ON gda.database_id = dt.id
+		WHERE gda.group_id = $1 AND gda.access_level > 0
+		ORDER BY dt.name ASC
+	`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var grants []GroupDatabaseGrant
+	for rows.Next() {
+		var g GroupDatabaseGrant
+		var lvl int
+		if err := rows.Scan(&g.DatabaseID, &g.DatabaseName, &lvl); err != nil {
+			return nil, err
+		}
+		g.AccessLevel = AccessLevel(lvl)
+		grants = append(grants, g)
+	}
+	return grants, nil
 }

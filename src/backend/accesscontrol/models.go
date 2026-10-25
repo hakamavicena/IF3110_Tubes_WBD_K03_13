@@ -13,8 +13,26 @@ const (
 
 type User struct {
 	ID       int    `json:"id"`
-	Username string `json:"username"` // asumsi dari auth
+	Username string `json:"username"`
 	IsAdmin  bool   `json:"is_admin"`
+	IsActive bool   `json:"is_active"`
+}
+
+type GroupDatabaseGrant struct {
+	DatabaseID   int         `json:"database_id"`
+	DatabaseName string      `json:"database_name"`
+	AccessLevel  AccessLevel `json:"access_level"`
+}
+
+type GroupDetail struct {
+	Group   Group
+	Members []User
+	Grants  []GroupDatabaseGrant
+}
+
+type UserWithGroups struct {
+	User   User
+	Groups []Group
 }
 
 type Group struct {
