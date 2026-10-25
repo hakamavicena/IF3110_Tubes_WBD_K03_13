@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hakamavicena/if3110-dbengine/internal/dbviewer"
-	"github.com/hakamavicena/if3110-dbengine/internal/migration"
-	"github.com/hakamavicena/if3110-dbengine/internal/ports"
+	"backend/dbengine/pkg/dbviewer"
+	"backend/dbengine/pkg/migration"
+	"backend/dbengine/pkg/ports"
 )
 
 func TestRegisterParsesTemplatesAndRejectsMissingUser(t *testing.T) {

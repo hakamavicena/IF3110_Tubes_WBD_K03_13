@@ -37,12 +37,3 @@ func (DenyAll) CanEdit(context.Context, int64, int64) (bool, error) { return fal
 func (DenyAll) AccessibleDatabases(context.Context, int64) ([]DatabaseAccess, error) {
 	return []DatabaseAccess{}, nil
 }
-
-// AllowAll is intended only for isolated local development and tests.
-type AllowAll struct{}
-
-func (AllowAll) CanView(context.Context, int64, int64) (bool, error) { return true, nil }
-func (AllowAll) CanEdit(context.Context, int64, int64) (bool, error) { return true, nil }
-func (AllowAll) AccessibleDatabases(context.Context, int64) ([]DatabaseAccess, error) {
-	return []DatabaseAccess{{DatabaseID: 1, Name: "demo", Level: LevelEdit}}, nil
-}

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hakamavicena/if3110-dbengine/internal/dbtarget"
+	"backend/dbengine/pkg/dbtarget"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )

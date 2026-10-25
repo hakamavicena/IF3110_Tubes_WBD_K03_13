@@ -7,9 +7,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/hakamavicena/if3110-dbengine/internal/apperr"
-	"github.com/hakamavicena/if3110-dbengine/internal/ports"
-	"github.com/hakamavicena/if3110-dbengine/internal/testpg"
+	"backend/dbengine/pkg/apperr"
+	"backend/dbengine/pkg/ports"
+	"backend/dbengine/pkg/testpg"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )

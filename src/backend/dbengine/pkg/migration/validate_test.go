@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hakamavicena/if3110-dbengine/internal/apperr"
+	"backend/dbengine/pkg/apperr"
 )
 
 func TestValidateInput(t *testing.T) {

@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/hakamavicena/if3110-dbengine/internal/apperr"
-	"github.com/hakamavicena/if3110-dbengine/internal/ports"
+	"backend/dbengine/pkg/apperr"
+	"backend/dbengine/pkg/ports"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
