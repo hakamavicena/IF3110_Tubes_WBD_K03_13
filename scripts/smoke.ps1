@@ -177,7 +177,7 @@ $dashHtmlAdmin = & curl.exe -s -b $cookieAdmin "$BaseUrl/admin"
 $csrfAdmin = Extract-CsrfToken $dashHtmlAdmin
 
 # Cari User ID outsider dari HTML admin
-$outsiderId = 5
+$outsiderId = 4
 if ($dashHtmlAdmin -match '<td><strong>outsider</strong></td>[\s\S]*?<input type="hidden" name="user_id" value="(\d+)">') {
     $outsiderId = [int]$Matches[1]
 }
