@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <title>Admin Panel - Database Management Platform</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 20px; line-height: 1.5; }
+        header { margin-bottom: 20px; }
+        nav a { margin-right: 10px; }
+        .alert { padding: 10px; margin-bottom: 15px; border-radius: 4px; }
+        .alert-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .alert-danger { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        section { margin-bottom: 30px; border: 1px solid #ddd; padding: 15px; border-radius: 6px; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 15px; }
+        th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        form.inline-form { display: inline-block; margin: 0; }
+        .form-box { background-color: #fafafa; padding: 12px; border: 1px solid #eee; margin-top: 10px; border-radius: 4px; }
+        .form-group { margin-bottom: 10px; }
+        label { display: inline-block; width: 160px; font-weight: bold; }
+        input[type="text"], input[type="password"], input[type="number"], select { padding: 5px; width: 250px; }
+        button { cursor: pointer; padding: 6px 12px; }
+    </style>
+</head>
+<body>
+    <header>
+        <h2>Panel Administrasi Platform</h2>
+        <nav>
+            <a href="/dashboard">Dashboard</a> |
+            <a href="/databases">Database</a> |
+            <strong>Admin</strong> |
+            <form action="/logout" method="POST" style="display:inline;">
+                <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+                <button type="submit">Logout</button>
+            </form>
+        </nav>
+    </header>
+
+    {{ if .Message }}
+    <div class="alert alert-success">{{ .Message }}</div>
+    {{ end }}
+    {{ if .Error }}
+    <div class="alert alert-danger">{{ .Error }}</div>
+    {{ end }}
+
+    <!-- 1. BAGIAN PENGGUNA (USERS) -->
+    <section id="users-section">
+        <h3>1. Manajemen Pengguna (Users)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Username</th>
+                    <th>Peran</th>
+                    <th>Status</th>
+                    <th>Grup</th>
+                    <th>Aksi</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{ range .Users }}
+                <tr>
+                    <td>{{ .User.ID }}</td>
+                    <td><strong>{{ .User.Username }}</strong></td>
+                    <td>{{ if .User.IsAdmin }}<span style="color: blue;">Platform Admin</span>{{ else }}User{{ end }}</td>
+                    <td>
+                        {{ if .User.IsActive }}
+                        <span style="color: green; font-weight: bold;">Aktif</span>
+                        {{ else }}
+                        <span style="color: red; font-weight: bold;">Nonaktif</span>
+                        {{ end }}
+                    </td>
+                    <td>
+                        {{ if .Groups }}
+                            {{ range $i, $g := .Groups }}{{ if $i }}, {{ end }}{{ $g.Name }}{{ end }}
+                        {{ else }}
+                            <em>(Tidak ada grup)</em>
+                        {{ end }}
+                    </td>
+                    <td>
+                        {{ if .User.IsActive }}
+                        <form action="/admin/users/status" method="POST" class="inline-form" onsubmit="return confirm('Nonaktifkan user {{ .User.Username }}? Sesi aktifnya akan langsung dicabut.');">
+                            <input type="hidden" name="csrf_token" value="{{ $.CSRFToken }}">
+                            <input type="hidden" name="user_id" value="{{ .User.ID }}">
+                            <input type="hidden" name="action" value="deactivate">
+                            <button type="submit" style="color: red;">Nonaktifkan</button>
+                        </form>
+                        {{ else }}
+                        <form action="/admin/users/status" method="POST" class="inline-form">
+                            <input type="hidden" name="csrf_token" value="{{ $.CSRFToken }}">
+                            <input type="hidden" name="user_id" value="{{ .User.ID }}">
+                            <input type="hidden" name="action" value="activate">
+                            <button type="submit" style="color: green;">Aktifkan</button>
+                        </form>
+                        {{ end }}
+                    </td>
+                </tr>
+                {{ else }}
+                <tr><td colspan="6">Tidak ada pengguna.</td></tr>
+                {{ end }}
+            </tbody>
+        </table>
+
+        <div class="form-box">
+            <h4>Buat Pengguna Baru</h4>
+            <form action="/admin/users" method="POST">
+                <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+                <div class="form-group">
+                    <label for="new_username">Username (3-50 char):</label>
+                    <input type="text" id="new_username" name="username" required pattern="^[a-zA-Z0-9_.-]{3,50}$" title="3-50 karakter alfanumerik atau _ . -">
+                </div>
+                <div class="form-group">
+                    <label for="new_password">Password (min 8 char):</label>
+                    <input type="password" id="new_password" name="password" required minlength="8">
+                </div>
+                <div class="form-group">
+                    <label for="new_is_admin">Platform Admin?</label>
+                    <input type="checkbox" id="new_is_admin" name="is_admin" value="true">
+                </div>
+                <button type="submit">Tambah Pengguna</button>
+            </form>
+        </div>
+    </section>
+
+    <!-- 2. BAGIAN GRUP (GROUPS) -->
+    <section id="groups-section">
+        <h3>2. Manajemen Grup & Hak Akses</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Nama Grup</th>
+                    <th>Anggota</th>
+                    <th>Hak Akses Database</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{ range .Groups }}
+                <tr>
+                    <td>{{ .Group.ID }}</td>
+                    <td><strong>{{ .Group.Name }}</strong></td>
+                    <td>
+                        {{ if .Members }}
+                            {{ range $i, $m := .Members }}{{ if $i }}, {{ end }}{{ $m.Username }}{{ end }}
+                        {{ else }}
+                            <em>(Kosong)</em>
+                        {{ end }}
+                    </td>
+                    <td>
+                        {{ if .Grants }}
+                            <ul>
+                            {{ range .Grants }}
+                                <li>
+                                    <strong>{{ .DatabaseName }}</strong>: 
+                                    {{ if eq .AccessLevel 2 }}<span style="color: green;">View + Edit</span>
+                                    {{ else if eq .AccessLevel 1 }}<span style="color: orange;">View Only</span>
+                                    {{ else }}None{{ end }}
+                                </li>
+                            {{ end }}
+                            </ul>
+                        {{ else }}
+                            <em>(Tidak ada hak akses)</em>
+                        {{ end }}
+                    </td>
+                </tr>
+                {{ else }}
+                <tr><td colspan="4">Tidak ada grup.</td></tr>
+                {{ end }}
+            </tbody>
+        </table>
+
+        <!-- Form Tambah Grup Baru -->
+        <div class="form-box">
+            <h4>Buat Grup Baru</h4>
+            <form action="/admin/groups" method="POST">
+                <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+                <div class="form-group">
+                    <label for="group_name">Nama Grup:</label>
+                    <input type="text" id="group_name" name="name" required maxlength="100">
+                </div>
+                <button type="submit">Tambah Grup</button>
+            </form>
+        </div>
+
+        <!-- Form Anggota Grup -->
+        <div class="form-box">
+            <h4>Kelola Keanggotaan Grup</h4>
+            <div style="display: flex; gap: 20px;">
+                <!-- Tambah ke grup -->
+                <form action="/admin/users/groups" method="POST">
+                    <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+                    <p><strong>Tambahkan Pengguna ke Grup:</strong></p>
+                    <div class="form-group">
+                        <label>Pilih Pengguna:</label>
+                        <select name="user_id" required>
+                            {{ range .Users }}
+                            <option value="{{ .User.ID }}">{{ .User.Username }} (ID: {{ .User.ID }})</option>
+                            {{ end }}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Pilih Grup:</label>
+                        <select name="group_id" required>
+                            {{ range .Groups }}
+                            <option value="{{ .Group.ID }}">{{ .Group.Name }}</option>
+                            {{ end }}
+                        </select>
+                    </div>
+                    <button type="submit">Tambahkan ke Grup</button>
+                </form>
+
+                <!-- Keluarkan dari grup -->
+                <form action="/admin/users/groups/remove" method="POST" onsubmit="return confirm('Keluarkan pengguna terpilih dari grup?');">
+                    <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+                    <p><strong>Keluarkan Pengguna dari Grup:</strong></p>
+                    <div class="form-group">
+                        <label>Pilih Pengguna:</label>
+                        <select name="user_id" required>
+                            {{ range .Users }}
+                            <option value="{{ .User.ID }}">{{ .User.Username }} (ID: {{ .User.ID }})</option>
+                            {{ end }}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Pilih Grup:</label>
+                        <select name="group_id" required>
+                            {{ range .Groups }}
+                            <option value="{{ .Group.ID }}">{{ .Group.Name }}</option>
+                            {{ end }}
+                        </select>
+                    </div>
+                    <button type="submit" style="color: red;">Keluarkan dari Grup</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Form Atur Akses Database untuk Grup -->
+        <div class="form-box">
+            <h4>Atur Hak Akses Grup ke Database</h4>
+            <form action="/admin/groups/access" method="POST">
+                <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+                <div class="form-group">
+                    <label>Pilih Grup:</label>
+                    <select name="group_id" required>
+                        {{ range .Groups }}
+                        <option value="{{ .Group.ID }}">{{ .Group.Name }}</option>
+                        {{ end }}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Pilih Database:</label>
+                    <select name="database_id" required>
+                        {{ range .Databases }}
+                        <option value="{{ .ID }}">{{ .Name }} ({{ .Host }}:{{ .Port }}/{{ .DatabaseName }})</option>
+                        {{ end }}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Level Akses:</label>
+                    <select name="access_level" required>
+                        <option value="1">View Only (Level 1)</option>
+                        <option value="2">View + Edit (Level 2)</option>
+                        <option value="0">Cabut Akses (Hapus Grant)</option>
+                    </select>
+                </div>
+                <button type="submit">Simpan Pengaturan Akses</button>
+            </form>
+        </div>
+    </section>
+
+    <!-- 3. BAGIAN KONEKSI DATABASE -->
+    <section id="databases-section">
+        <h3>3. Koneksi Database Target</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Nama Target</th>
+                    <th>Host</th>
+                    <th>Port</th>
+                    <th>Database</th>
+                    <th>Username</th>
+                    <th>SSL Mode</th>
+                    <th>Aksi</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{ range .Databases }}
+                <tr>
+                    <td>{{ .ID }}</td>
+                    <td><strong>{{ .Name }}</strong></td>
+                    <td>{{ .Host }}</td>
+                    <td>{{ .Port }}</td>
+                    <td>{{ .DatabaseName }}</td>
+                    <td>{{ .Username }}</td>
+                    <td>{{ .SSLMode }}</td>
+                    <td>
+                        <form action="/admin/databases/delete" method="POST" class="inline-form" onsubmit="return confirm('Yakin ingin menghapus koneksi database {{ .Name }}? Seluruh grant dan migration terkait akan ikut terhapus.');">
+                            <input type="hidden" name="csrf_token" value="{{ $.CSRFToken }}">
+                            <input type="hidden" name="database_id" value="{{ .ID }}">
+                            <button type="submit" style="color: red;">Hapus</button>
+                        </form>
+                    </td>
+                </tr>
+                {{ else }}
+                <tr><td colspan="8">Belum ada database target yang terdaftar.</td></tr>
+                {{ end }}
+            </tbody>
+        </table>
+
+        <!-- Form Tambah Koneksi Database Target -->
+        <div class="form-box">
+            <h4>Daftarkan Koneksi Database Target Baru</h4>
+            <form action="/admin/databases" method="POST">
+                <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+                <div class="form-group">
+                    <label for="db_target_name">Nama Display:</label>
+                    <input type="text" id="db_target_name" name="name" required placeholder="mis. demo_target">
+                </div>
+                <div class="form-group">
+                    <label for="db_host">Host:</label>
+                    <input type="text" id="db_host" name="host" required value="localhost">
+                </div>
+                <div class="form-group">
+                    <label for="db_port">Port:</label>
+                    <input type="number" id="db_port" name="port" required value="5432" min="1" max="65535">
+                </div>
+                <div class="form-group">
+                    <label for="db_name">Nama Database:</label>
+                    <input type="text" id="db_name" name="database_name" required placeholder="mis. target_db">
+                </div>
+                <div class="form-group">
+                    <label for="db_username">Username Database:</label>
+                    <input type="text" id="db_username" name="username" required placeholder="mis. postgres">
+                </div>
+                <div class="form-group">
+                    <label for="db_password">Password:</label>
+                    <input type="password" id="db_password" name="password" required>
+                </div>
+                <div class="form-group">
+                    <label for="db_ssl">SSL Mode:</label>
+                    <select id="db_ssl" name="ssl_mode">
+                        <option value="disable">disable</option>
+                        <option value="prefer" selected>prefer</option>
+                        <option value="require">require</option>
+                    </select>
+                </div>
+                <button type="submit">Uji & Simpan Koneksi</button>
+            </form>
+        </div>
+    </section>
+</body>
+</html>

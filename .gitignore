@@ -1,0 +1,16 @@
+# Environment and secret files
+.env
+.env.local
+*.key
+*.pem
+
+# Binaries
+*.exe
+server
+
+# Temporary test cookie jars
+cookie.txt
+*_cookie.txt
+cookie_*.txt
+*.jar
+

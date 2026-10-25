@@ -1,0 +1,220 @@
+
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - Database Management</title>
+    <link
+        href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+        rel="stylesheet"
+    >
+
+    <style>
+        body {
+            background-color: #f5f7fb;
+            min-height: 100vh;
+        }
+
+        .navbar-brand {
+            font-weight: 700;
+            letter-spacing: 0.3px;
+        }
+
+        .welcome-card {
+            background: linear-gradient(135deg, #e8f1ff, #ffffff);
+            border: 1px solid #d8e5fa;
+        }
+
+        .database-card {
+            border: 1px solid #e5eaf2;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .database-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 0.4rem 1rem rgba(0, 0, 0, 0.06);
+        }
+
+        .database-icon {
+            width: 46px;
+            height: 46px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-color: #e8f1ff;
+            color: #0d6efd;
+            border-radius: 12px;
+            font-size: 1.35rem;
+            flex-shrink: 0;
+        }
+
+        .access-badge {
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .section-title {
+            font-weight: 700;
+            color: #24334d;
+        }
+    </style>
+</head>
+
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary shadow-sm">
+        <div class="container py-2">
+            <a class="navbar-brand" href="/dashboard">
+                <span class="me-2">▤</span> DB Platform
+            </a>
+
+            <button
+                class="navbar-toggler"
+                type="button"
+                data-bs-toggle="collapse"
+                data-bs-target="#navbarContent"
+                aria-controls="navbarContent"
+                aria-expanded="false"
+                aria-label="Toggle navigation"
+            >
+                <span class="navbar-toggler-icon"></span>
+            </button>
+
+            <div class="collapse navbar-collapse" id="navbarContent">
+                <div class="navbar-nav ms-auto align-items-lg-center gap-lg-2">
+                    <a class="nav-link active" href="/dashboard">Dashboard</a>
+                    <a class="nav-link" href="/databases">Database</a>
+
+                    {{ if .IsAdmin }}
+                    <a class="nav-link" href="/admin">Admin</a>
+                    {{ end }}
+
+                    <form action="/logout" method="POST" class="ms-lg-3 mt-2 mt-lg-0">
+                        <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+                        <button type="submit" class="btn btn-outline-light btn-sm px-3">
+                            Logout
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container py-4 py-md-5">
+
+        <div class="card welcome-card rounded-4 shadow-sm mb-4">
+            <div class="card-body p-4 p-md-5">
+                <div class="d-flex align-items-center gap-3">
+                    <div class="database-icon rounded-circle" style="width: 58px; height: 58px;">
+                        <span style="font-size: 1.6rem;">👤</span>
+                    </div>
+
+                    <div>
+                        <h2 class="h4 fw-bold mb-2">
+                            Selamat Datang di Platform Manajemen Database
+                        </h2>
+
+                        <p class="text-secondary mb-0">
+                            Login sebagai User ID:
+                            <strong>{{ .UserID }}</strong>
+
+                            {{ if .IsAdmin }}
+                            <span class="badge text-bg-primary ms-2">
+                                Platform Admin
+                            </span>
+                            {{ end }}
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Database List -->
+        <div class="card border-0 rounded-4 shadow-sm">
+            <div class="card-body p-3 p-md-4">
+                <div class="d-flex align-items-center gap-2 mb-4">
+                    <div class="database-icon">
+                        <span>▤</span>
+                    </div>
+
+                    <h3 class="h5 section-title mb-0">
+                        Database yang Dapat Anda Akses
+                    </h3>
+                </div>
+
+                <div class="d-flex flex-column gap-3">
+                    {{ range .Databases }}
+                    <div class="card database-card rounded-3">
+                        <div class="card-body p-3 p-md-4">
+                            <div class="row align-items-center g-3">
+                                <div class="col-auto">
+                                    <div class="database-icon">
+                                        <span>▤</span>
+                                    </div>
+                                </div>
+
+                                <div class="col">
+                                    <h4 class="h6 fw-bold mb-2">
+                                        {{ .Name }}
+                                    </h4>
+
+                                    <div>
+                                        {{ if eq .Level 2 }}
+                                        <span class="badge rounded-pill text-bg-success access-badge">
+                                            View + Edit
+                                        </span>
+                                        {{ else if eq .Level 1 }}
+                                        <span class="badge rounded-pill text-bg-primary access-badge">
+                                            View Only
+                                        </span>
+                                        {{ else }}
+                                        <span class="badge rounded-pill text-bg-secondary access-badge">
+                                            None
+                                        </span>
+                                        {{ end }}
+                                    </div>
+                                </div>
+
+                                <div class="col-12 col-lg-auto">
+                                    <div class="d-flex flex-column flex-sm-row gap-2">
+                                        <a
+                                            href="/databases/{{ .DatabaseID }}"
+                                            class="btn btn-outline-primary btn-sm px-3"
+                                        >
+                                            Lihat Schema &amp; Data
+                                        </a>
+
+                                        <a
+                                            href="/databases/{{ .DatabaseID }}/migrations"
+                                            class="btn btn-outline-secondary btn-sm px-3"
+                                        >
+                                            Riwayat Migration
+                                        </a>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    {{ else }}
+                    <div class="alert alert-info border-0 rounded-3 mb-0" role="alert">
+                        <div class="fw-semibold mb-1">
+                            Belum ada database yang dapat diakses.
+                        </div>
+                        <div class="small">
+                            Hubungi Platform Admin untuk memberikan akses grup ke database.
+                        </div>
+                    </div>
+                    {{ end }}
+                </div>
+            </div>
+        </div>
+
+        <footer class="text-center text-secondary small mt-4">
+            Database Management Platform
+        </footer>
+
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

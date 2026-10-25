@@ -1,0 +1,8 @@
+.env
+.env.local
+*.key
+*.pem
+*.exe
+cookie.txt
+*_cookie.txt
+*.jar
