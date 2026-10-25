@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"backend/accesscontrol"
@@ -23,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func findTemplatePath(filename string) string {
@@ -118,6 +120,32 @@ func main() {
 	defer targetManager.Close()
 
 	adminHandler := accesscontrol.NewAdminHandler(accessService, accessRepo, targetManager, box)
+	adminHandler.SetTemplatePath(findTemplatePath("admin.html"))
+	adminHandler.SetSessionInvalidator(func(userID int) error {
+		return authService.InvalidateUserSessions(userID)
+	})
+
+	// Bootstrap Admin jika belum ada akun admin di database
+	adminCount, err := accessRepo.GetActiveAdminCount()
+	if err != nil {
+		log.Fatalf("Gagal memeriksa status admin di database: %v", err)
+	}
+	if adminCount == 0 {
+		adminUser := strings.TrimSpace(os.Getenv("ADMIN_USERNAME"))
+		adminPass := os.Getenv("ADMIN_PASSWORD")
+		if adminUser == "" || len(adminPass) < 8 {
+			log.Fatal("Belum ada admin terdaftar. Setel variabel environment ADMIN_USERNAME dan ADMIN_PASSWORD (minimal 8 karakter) untuk bootstrap admin.")
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(adminPass), bcrypt.DefaultCost)
+		if err != nil {
+			log.Fatalf("Gagal hash password bootstrap admin: %v", err)
+		}
+		_, err = accessRepo.CreateUserWithPassword(adminUser, string(hash), true)
+		if err != nil {
+			log.Fatalf("Gagal membuat user admin bootstrap: %v", err)
+		}
+		log.Printf("Bootstrap admin '%s' berhasil dibuat", adminUser)
+	}
 
 	authorizer := accesscontrol.NewAuthorizer(accessService, accessRepo)
 	viewerService := dbviewer.NewService(authorizer, targetManager)
@@ -204,12 +232,22 @@ func main() {
 	mux.Handle("/dashboard", authHandler.AuthMiddleware(dashboardHandler))
 
 	// Rute Admin (khusus Platform Admin)
-	admin := func(next http.HandlerFunc) http.Handler {
+	adminGet := func(next http.HandlerFunc) http.Handler {
+		return authHandler.AuthMiddleware(http.HandlerFunc(accesscontrol.RequireAdmin(accessService, next)))
+	}
+	adminPost := func(next http.HandlerFunc) http.Handler {
 		return authHandler.AuthMiddleware(auth.CSRFMiddleware(http.HandlerFunc(accesscontrol.RequireAdmin(accessService, next))))
 	}
-	mux.Handle("/admin/users/groups", admin(adminHandler.AddUserToGroup))
-	mux.Handle("/admin/groups/access", admin(adminHandler.SetGroupAccess))
-	mux.Handle("/admin/databases", admin(adminHandler.CreateDatabaseConnection))
+
+	mux.Handle("/admin", adminGet(adminHandler.AdminDashboard))
+	mux.Handle("/admin/users", adminPost(adminHandler.CreateUser))
+	mux.Handle("/admin/users/status", adminPost(adminHandler.SetUserStatus))
+	mux.Handle("/admin/groups", adminPost(adminHandler.CreateGroup))
+	mux.Handle("/admin/users/groups", adminPost(adminHandler.AddUserToGroup))
+	mux.Handle("/admin/users/groups/remove", adminPost(adminHandler.RemoveUserFromGroup))
+	mux.Handle("/admin/groups/access", adminPost(adminHandler.SetGroupAccess))
+	mux.Handle("/admin/databases", adminPost(adminHandler.CreateDatabaseConnection))
+	mux.Handle("/admin/databases/delete", adminPost(adminHandler.DeleteDatabaseConnection))
 
 	// Rute Database Engine (Viewer & Migration) dari modul B
 	protectDB := func(next http.Handler) http.Handler {

@@ -12,3 +12,17 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  pg_target2:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: targetpass
+      POSTGRES_DB: target2_db
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d target2_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
