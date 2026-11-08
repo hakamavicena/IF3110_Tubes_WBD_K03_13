@@ -7,6 +7,8 @@ services:
       POSTGRES_DB: platform
     ports:
       - "5433:5432"
+    volumes:
+      - pg_platform_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app -d platform"]
       interval: 5s
@@ -21,8 +23,13 @@ services:
       POSTGRES_DB: target2_db
     ports:
       - "5434:5432"
+    volumes:
+      - pg_target2_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app -d target2_db"]
       interval: 5s
       timeout: 3s
       retries: 10
+volumes:
+  pg_platform_data:
+  pg_target2_data:
