@@ -20,21 +20,13 @@ func (h *AuthHandler) AuthMiddleware(next http.Handler) http.Handler {
 
 		session, newID, err := h.service.ValidateAndRotateSession(cookie.Value)
 		if err != nil {
-			http.Error(w, "Session expired or invalid", http.StatusUnauthorized)
+			WriteError(w, http.StatusUnauthorized, "sesi berakhir atau tidak valid")
 			return
 		}
 
 		// Jika rotasi berkala terjadi, kirim cookie baru dengan ID yang baru diterbitkan
 		if newID != "" {
-			http.SetCookie(w, &http.Cookie{
-				Name:     "session_id",
-				Value:    newID,
-				Expires:  session.AbsoluteExpiration,
-				HttpOnly: true,
-				Secure:   h.service.config.SecureCookie,
-				SameSite: http.SameSiteLaxMode,
-				Path:     "/",
-			})
+			h.setSessionCookie(w, newID, session.AbsoluteExpiration)
 		}
 
 		ctx := context.WithValue(r.Context(), SessionContextKey, session)
@@ -48,18 +40,19 @@ func CSRFMiddleware(next http.Handler) http.Handler {
 		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch || r.Method == http.MethodDelete {
 			session, ok := r.Context().Value(SessionContextKey).(*Session)
 			if !ok || session == nil {
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				WriteError(w, http.StatusUnauthorized, "unauthorized")
 				return
 			}
 
-			_ = r.ParseForm()
-			provided := r.FormValue("csrf_token")
-			if provided == "" {
-				provided = r.Header.Get("X-CSRF-Token")
+			provided := r.Header.Get("X-CSRF-Token")
+			if provided == "" && !isJSONRequest(r) {
+				// Fallback form-urlencoded hanya untuk halaman HTML lama (non-SPA).
+				_ = r.ParseForm()
+				provided = r.FormValue("csrf_token")
 			}
 
 			if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(session.CSRFToken)) != 1 {
-				http.Error(w, "Invalid or missing CSRF token", http.StatusForbidden)
+				WriteError(w, http.StatusForbidden, "token CSRF tidak valid atau tidak ada")
 				return
 			}
 		}
