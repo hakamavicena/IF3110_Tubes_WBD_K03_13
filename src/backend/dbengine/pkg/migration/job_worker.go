@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"backend/dbengine/pkg/apperr"
 	"backend/dbengine/pkg/ports"
 	"backend/dbengine/pkg/queue"
 )
@@ -60,7 +61,7 @@ func (jc *JobCoordinator) EnqueueJob(ctx context.Context, userID, databaseID, jo
 			return nil, err
 		}
 		if !canEdit {
-			return nil, fmt.Errorf("forbidden: user %d does not have edit access to database %d", userID, databaseID)
+			return nil, fmt.Errorf("%w: user %d does not have edit access to database %d", apperr.ErrForbidden, userID, databaseID)
 		}
 	}
 
@@ -89,7 +90,7 @@ func (jc *JobCoordinator) GetJobStatus(ctx context.Context, userID, databaseID, 
 			return nil, err
 		}
 		if !canView {
-			return nil, fmt.Errorf("forbidden: user %d does not have view access to database %d", userID, databaseID)
+			return nil, fmt.Errorf("%w: user %d does not have view access to database %d", apperr.ErrForbidden, userID, databaseID)
 		}
 	}
 	return jc.repo.GetJob(ctx, databaseID, jobID)
@@ -106,10 +107,87 @@ func (jc *JobCoordinator) RequestBatchRecovery(
 			return nil, err
 		}
 		if !canEdit {
-			return nil, fmt.Errorf("forbidden: user %d does not have edit access to database %d", userID, databaseID)
+			return nil, fmt.Errorf("%w: user %d does not have edit access to database %d", apperr.ErrForbidden, userID, databaseID)
 		}
 	}
 	return jc.repo.CreateBatchRecoveryJob(ctx, databaseID, migrationID, userID, action)
+}
+
+func (jc *JobCoordinator) ListMigrationsM2(ctx context.Context, userID, databaseID int64) ([]Migration, bool, *DatabaseLock, error) {
+	if jc.authz != nil {
+		canView, err := jc.authz.CanView(ctx, userID, databaseID)
+		if err != nil {
+			return nil, false, nil, err
+		}
+		if !canView {
+			return nil, false, nil, apperr.ErrForbidden
+		}
+	}
+	items, err := jc.repo.ListM2(ctx, databaseID)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	canEdit := false
+	if jc.authz != nil {
+		canEdit, _ = jc.authz.CanEdit(ctx, userID, databaseID)
+	}
+	lock, _ := jc.lockManager.GetLock(ctx, databaseID)
+	return items, canEdit, lock, nil
+}
+
+func (jc *JobCoordinator) GetMigrationDetailM2(ctx context.Context, userID, databaseID, migrationID int64) (*Migration, []Job, bool, *DatabaseLock, error) {
+	if jc.authz != nil {
+		canView, err := jc.authz.CanView(ctx, userID, databaseID)
+		if err != nil {
+			return nil, nil, false, nil, err
+		}
+		if !canView {
+			return nil, nil, false, nil, apperr.ErrForbidden
+		}
+	}
+	m, err := jc.repo.GetM2(ctx, migrationID)
+	if err != nil {
+		return nil, nil, false, nil, err
+	}
+	if m.DatabaseID != databaseID {
+		return nil, nil, false, nil, apperr.ErrNotFound
+	}
+	jobs, err := jc.repo.ListJobsByMigration(ctx, databaseID, migrationID)
+	if err != nil {
+		return nil, nil, false, nil, err
+	}
+	canEdit := false
+	if jc.authz != nil {
+		canEdit, _ = jc.authz.CanEdit(ctx, userID, databaseID)
+	}
+	lock, _ := jc.lockManager.GetLock(ctx, databaseID)
+	return m, jobs, canEdit, lock, nil
+}
+
+func (jc *JobCoordinator) CreateMigrationM2(ctx context.Context, userID, databaseID int64, in MigrationInputM2) (*Migration, *Job, error) {
+	if jc.authz != nil {
+		canEdit, err := jc.authz.CanEdit(ctx, userID, databaseID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !canEdit {
+			return nil, nil, apperr.ErrForbidden
+		}
+	}
+	return jc.repo.CreateMigrationWithJob(ctx, databaseID, userID, in)
+}
+
+func (jc *JobCoordinator) UpdateMigrationM2(ctx context.Context, userID, databaseID, migrationID int64, in MigrationInputM2) (*Migration, *Job, error) {
+	if jc.authz != nil {
+		canEdit, err := jc.authz.CanEdit(ctx, userID, databaseID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !canEdit {
+			return nil, nil, apperr.ErrForbidden
+		}
+	}
+	return jc.repo.UpdateDraftWithJob(ctx, databaseID, migrationID, userID, in)
 }
 
 func (jc *JobCoordinator) RecoverOnStartup(ctx context.Context, staleThreshold time.Duration) (int64, error) {

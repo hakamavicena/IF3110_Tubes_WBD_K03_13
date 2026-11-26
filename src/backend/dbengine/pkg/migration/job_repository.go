@@ -354,3 +354,296 @@ func (r *PGRepository) FinalizeJobExecution(
 
 	return tx.Commit(ctx)
 }
+
+type MigrationInputM2 struct {
+	Title              string
+	SQL                string
+	SQLDown            string
+	IsIrreversible     bool
+	IrreversibleReason string
+	ExecutionMode      ExecutionMode
+	BatchColumn        string
+	BatchSize          int
+}
+
+func ValidateMigrationInputM2(in MigrationInputM2) error {
+	if err := ValidateInput(in.Title, in.SQL); err != nil {
+		return err
+	}
+	if in.IsIrreversible {
+		if strings.TrimSpace(in.IrreversibleReason) == "" {
+			return fmt.Errorf("%w: alasan irreversible wajib diisi jika migration ditandai irreversible", apperr.ErrInvalidInput)
+		}
+	} else {
+		if strings.TrimSpace(in.SQLDown) == "" {
+			return fmt.Errorf("%w: sql_down wajib diisi untuk migration yang bukan irreversible", apperr.ErrInvalidInput)
+		}
+		if err := ValidateInput(in.Title, in.SQLDown); err != nil {
+			return err
+		}
+	}
+	mode := in.ExecutionMode
+	if mode == "" {
+		mode = ExecutionModeStandard
+	}
+	if mode != ExecutionModeStandard && mode != ExecutionModeBatch {
+		return fmt.Errorf("%w: execution_mode harus 'standard' atau 'batch'", apperr.ErrInvalidInput)
+	}
+	if mode == ExecutionModeBatch {
+		if !reIdentPart.MatchString(strings.TrimSpace(in.BatchColumn)) {
+			return fmt.Errorf("%w: batch_column wajib diisi dengan nama kolom yang valid pada mode batch", apperr.ErrInvalidInput)
+		}
+		if in.BatchSize <= 0 {
+			return fmt.Errorf("%w: batch_size harus lebih besar dari 0 pada mode batch", apperr.ErrInvalidInput)
+		}
+		if _, err := extractTargetTable(in.SQL); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+const selectMigrationM2 = `
+	SELECT m.id, m.database_id, m.version, m.revision, m.title, m.sql,
+	       COALESCE(m.sql_down, ''), m.is_irreversible, COALESCE(m.irreversible_reason, ''),
+	       m.execution_mode, COALESCE(m.batch_column, ''), COALESCE(m.batch_size, 0),
+	       m.is_immutable, m.active_state, m.active_execution_id, m.status,
+	       COALESCE(m.error_message, ''), m.created_by, cu.username, m.created_at,
+	       m.executed_by, eu.username, m.executed_at, m.duration_ms
+	FROM migrations m
+	JOIN users cu ON cu.id = m.created_by
+	LEFT JOIN users eu ON eu.id = m.executed_by`
+
+func scanMigrationM2(row pgx.Row) (*Migration, error) {
+	var m Migration
+	var execMode, activeState, status string
+	err := row.Scan(
+		&m.ID, &m.DatabaseID, &m.Version, &m.Revision, &m.Title, &m.SQL,
+		&m.SQLDown, &m.IsIrreversible, &m.IrreversibleReason,
+		&execMode, &m.BatchColumn, &m.BatchSize,
+		&m.IsImmutable, &activeState, &m.ActiveExecutionID, &status,
+		&m.ErrorMessage, &m.CreatedBy, &m.CreatedByName, &m.CreatedAt,
+		&m.ExecutedBy, &m.ExecutedByName, &m.ExecutedAt, &m.DurationMs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	m.ExecutionMode = ExecutionMode(execMode)
+	m.ActiveState = ActiveState(activeState)
+	m.Status = Status(status)
+	return &m, nil
+}
+
+func (r *PGRepository) GetM2(ctx context.Context, id int64) (*Migration, error) {
+	m, err := scanMigrationM2(r.db.QueryRow(ctx, selectMigrationM2+" WHERE m.id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, apperr.ErrNotFound
+	}
+	return m, err
+}
+
+func (r *PGRepository) ListM2(ctx context.Context, databaseID int64) ([]Migration, error) {
+	rows, err := r.db.Query(ctx, selectMigrationM2+" WHERE m.database_id = $1 ORDER BY m.version DESC", databaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Migration
+	for rows.Next() {
+		m, err := scanMigrationM2(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
+func (r *PGRepository) CreateMigrationWithJob(ctx context.Context, databaseID, userID int64, in MigrationInputM2) (*Migration, *Job, error) {
+	if err := ValidateMigrationInputM2(in); err != nil {
+		return nil, nil, err
+	}
+	mode := in.ExecutionMode
+	if mode == "" {
+		mode = ExecutionModeStandard
+	}
+	batchCol := strings.TrimSpace(in.BatchColumn)
+	var batchSizePtr *int
+	if mode == ExecutionModeBatch && in.BatchSize > 0 {
+		sz := in.BatchSize
+		batchSizePtr = &sz
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", databaseID); err != nil {
+		return nil, nil, err
+	}
+
+	var migID int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO migrations (
+			database_id, version, revision, title, sql, sql_down,
+			is_irreversible, irreversible_reason, execution_mode,
+			batch_column, batch_size, status, created_by
+		) VALUES (
+			$1, (SELECT COALESCE(MAX(version), 0) + 1 FROM migrations WHERE database_id = $1),
+			1, $2, $3, NULLIF($4, ''),
+			$5, NULLIF($6, ''), $7,
+			NULLIF($8, ''), $9, 'draft', $10
+		) RETURNING id`,
+		databaseID, strings.TrimSpace(in.Title), in.SQL, in.SQLDown,
+		in.IsIrreversible, strings.TrimSpace(in.IrreversibleReason), string(mode),
+		batchCol, batchSizePtr, userID,
+	).Scan(&migID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var jobID int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO migration_jobs (
+			database_id, migration_id, action, status, sql_snapshot,
+			execution_mode, batch_column, batch_size, requested_by
+		) VALUES (
+			$1, $2, 'apply', 'draft', $3,
+			$4, NULLIF($5, ''), $6, $7
+		) RETURNING id`,
+		databaseID, migID, in.SQL, string(mode), batchCol, batchSizePtr, userID,
+	).Scan(&jobID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	mig, err := r.GetM2(ctx, migID)
+	if err != nil {
+		return nil, nil, err
+	}
+	job, err := r.GetJob(ctx, databaseID, jobID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return mig, job, nil
+}
+
+func (r *PGRepository) UpdateDraftWithJob(ctx context.Context, databaseID, migrationID, userID int64, in MigrationInputM2) (*Migration, *Job, error) {
+	if err := ValidateMigrationInputM2(in); err != nil {
+		return nil, nil, err
+	}
+	mode := in.ExecutionMode
+	if mode == "" {
+		mode = ExecutionModeStandard
+	}
+	batchCol := strings.TrimSpace(in.BatchColumn)
+	var batchSizePtr *int
+	if mode == ExecutionModeBatch && in.BatchSize > 0 {
+		sz := in.BatchSize
+		batchSizePtr = &sz
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var isImmutable bool
+	var status string
+	err = tx.QueryRow(ctx, `
+		SELECT is_immutable, status
+		FROM migrations
+		WHERE id = $1 AND database_id = $2
+		FOR UPDATE`,
+		migrationID, databaseID,
+	).Scan(&isImmutable, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, apperr.ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if isImmutable {
+		return nil, nil, fmt.Errorf("%w: definisi migration yang sudah pernah dieksekusi bersifat immutable dan tidak dapat diubah", apperr.ErrNotExecutable)
+	}
+	if Status(status) != StatusDraft && Status(status) != StatusFailed {
+		return nil, nil, fmt.Errorf("%w: hanya migration berstatus draft atau failed yang dapat diedit", apperr.ErrNotExecutable)
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE migrations
+		SET revision = revision + 1,
+		    title = $3,
+		    sql = $4,
+		    sql_down = NULLIF($5, ''),
+		    is_irreversible = $6,
+		    irreversible_reason = NULLIF($7, ''),
+		    execution_mode = $8,
+		    batch_column = NULLIF($9, ''),
+		    batch_size = $10,
+		    status = 'draft',
+		    error_message = NULL
+		WHERE id = $1 AND database_id = $2`,
+		migrationID, databaseID, strings.TrimSpace(in.Title), in.SQL, in.SQLDown,
+		in.IsIrreversible, strings.TrimSpace(in.IrreversibleReason), string(mode),
+		batchCol, batchSizePtr,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var jobID int64
+	err = tx.QueryRow(ctx, `
+		UPDATE migration_jobs
+		SET status = 'draft',
+		    sql_snapshot = $3,
+		    execution_mode = $4,
+		    batch_column = NULLIF($5, ''),
+		    batch_size = $6,
+		    error_message = NULL
+		WHERE id = (
+			SELECT id FROM migration_jobs
+			WHERE database_id = $1 AND migration_id = $2 AND status IN ('draft', 'failed')
+			ORDER BY id DESC LIMIT 1
+		)
+		RETURNING id`,
+		databaseID, migrationID, in.SQL, string(mode), batchCol, batchSizePtr,
+	).Scan(&jobID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = tx.QueryRow(ctx, `
+			INSERT INTO migration_jobs (
+				database_id, migration_id, action, status, sql_snapshot,
+				execution_mode, batch_column, batch_size, requested_by
+			) VALUES (
+				$1, $2, 'apply', 'draft', $3,
+				$4, NULLIF($5, ''), $6, $7
+			) RETURNING id`,
+			databaseID, migrationID, in.SQL, string(mode), batchCol, batchSizePtr, userID,
+		).Scan(&jobID)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	mig, err := r.GetM2(ctx, migrationID)
+	if err != nil {
+		return nil, nil, err
+	}
+	job, err := r.GetJob(ctx, databaseID, jobID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return mig, job, nil
+}
