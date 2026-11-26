@@ -44,6 +44,65 @@ func TestValidateInput(t *testing.T) {
 	}
 }
 
+func TestValidateDefinition(t *testing.T) {
+	tests := []struct {
+		name               string
+		sqlUp              string
+		sqlDown            string
+		isIrreversible     bool
+		irreversibleReason string
+		wantErr            bool
+	}{
+		{
+			name:    "reversible migration with up and down SQL",
+			sqlUp:   "CREATE TABLE items(id int);",
+			sqlDown: "DROP TABLE items;",
+		},
+		{
+			name:    "reversible migration requires down SQL",
+			sqlUp:   "CREATE TABLE items(id int);",
+			wantErr: true,
+		},
+		{
+			name:               "irreversible migration requires a reason",
+			sqlUp:              "DELETE FROM items;",
+			isIrreversible:     true,
+			irreversibleReason: " ",
+			wantErr:            true,
+		},
+		{
+			name:               "irreversible migration with reason",
+			sqlUp:              "DELETE FROM items;",
+			isIrreversible:     true,
+			irreversibleReason: "Deleted data cannot be recovered.",
+		},
+		{
+			name:    "down SQL rejects transaction control",
+			sqlUp:   "CREATE TABLE items(id int);",
+			sqlDown: "DROP TABLE items; COMMIT;",
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateDefinition(
+				"migration",
+				test.sqlUp,
+				test.sqlDown,
+				test.isIrreversible,
+				test.irreversibleReason,
+			)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("ValidateDefinition() error = %v, wantErr %v", err, test.wantErr)
+			}
+			if err != nil && !errors.Is(err, apperr.ErrInvalidInput) {
+				t.Fatalf("error is not ErrInvalidInput: %v", err)
+			}
+		})
+	}
+}
+
 func TestDescribeErrorHidesGenericDetails(t *testing.T) {
 	if got := describeError(errors.New("sensitive DSN")); got != "eksekusi gagal" {
 		t.Fatalf("unexpected message: %q", got)

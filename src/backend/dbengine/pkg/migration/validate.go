@@ -17,15 +17,42 @@ var txControl = regexp.MustCompile(
 
 func ValidateInput(title, sql string) error {
 	title = strings.TrimSpace(title)
-	switch {
-	case title == "" || utf8.RuneCountInString(title) > 200:
+	if title == "" || utf8.RuneCountInString(title) > 200 {
 		return fmt.Errorf("%w: judul wajib diisi (maks 200 karakter)", apperr.ErrInvalidInput)
+	}
+	return validateSQL(sql, "SQL")
+}
+
+func ValidateDefinition(
+	title, sqlUp, sqlDown string,
+	isIrreversible bool,
+	irreversibleReason string,
+) error {
+	if err := ValidateInput(title, sqlUp); err != nil {
+		return err
+	}
+
+	if isIrreversible {
+		if strings.TrimSpace(irreversibleReason) == "" {
+			return fmt.Errorf("%w: alasan irreversible wajib diisi", apperr.ErrInvalidInput)
+		}
+		return nil
+	}
+
+	return validateSQL(sqlDown, "SQL down")
+}
+
+func validateSQL(sql, field string) error {
+	switch {
 	case strings.TrimSpace(sql) == "":
-		return fmt.Errorf("%w: SQL tidak boleh kosong", apperr.ErrInvalidInput)
+		return fmt.Errorf("%w: %s tidak boleh kosong", apperr.ErrInvalidInput, field)
 	case len(sql) > maxSQLBytes:
-		return fmt.Errorf("%w: SQL terlalu besar (maks 1 MiB)", apperr.ErrInvalidInput)
+		return fmt.Errorf("%w: %s terlalu besar (maks 1 MiB)", apperr.ErrInvalidInput, field)
 	case txControl.MatchString(maskSQLNonCode(sql)):
-		return fmt.Errorf("%w: jangan sertakan perintah kontrol transaksi; platform mengelola transaksi", apperr.ErrInvalidInput)
+		return fmt.Errorf(
+			"%w: jangan sertakan perintah kontrol transaksi; platform mengelola transaksi",
+			apperr.ErrInvalidInput,
+		)
 	default:
 		return nil
 	}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -87,6 +88,10 @@ func (h *Handler) Register(mux *http.ServeMux, protect func(http.Handler) http.H
 	route("GET /databases/{dbID}/migrations/{migID}/edit", h.editMigrationForm)
 	route("POST /databases/{dbID}/migrations/{migID}", h.updateMigration)
 	route("POST /databases/{dbID}/migrations/{migID}/execute", h.executeMigration)
+	route("POST /api/databases/{dbID}/migrations", h.apiCreateMigration)
+	route("PUT /api/databases/{dbID}/migrations/{migID}", h.apiUpdateMigration)
+	route("POST /api/databases/{dbID}/migrations/{migID}/rollback", h.apiRollbackMigration)
+	route("POST /api/databases/{dbID}/migrations/{migID}/forward", h.apiForwardMigration)
 }
 
 func pathID(r *http.Request, name string) (int64, error) {
@@ -245,6 +250,94 @@ type tableDataResponse struct {
 	PageSize int         `json:"page_size"`
 	Total    int64       `json:"total"`
 	Pages    int         `json:"pages"`
+}
+
+type createMigrationRequest struct {
+	Title              string `json:"title"`
+	SQL                string `json:"sql"`
+	SQLDown            string `json:"sql_down"`
+	IsIrreversible     bool   `json:"is_irreversible"`
+	IrreversibleReason string `json:"irreversible_reason"`
+}
+
+type migrationDefinitionDTO struct {
+	ID                 int64            `json:"id"`
+	DatabaseID         int64            `json:"database_id"`
+	Version            int              `json:"version"`
+	Title              string           `json:"title"`
+	SQL                string           `json:"sql"`
+	SQLDown            string           `json:"sql_down"`
+	IsIrreversible     bool             `json:"is_irreversible"`
+	IrreversibleReason string           `json:"irreversible_reason"`
+	Status             migration.Status `json:"status"`
+}
+
+type migrationActionResponse struct {
+	Migration migrationDefinitionDTO `json:"migration"`
+}
+
+func (h *Handler) apiRollbackMigration(w http.ResponseWriter, r *http.Request) {
+	h.apiMigrationAction(w, r, migration.ActionRollback)
+}
+
+func (h *Handler) apiForwardMigration(w http.ResponseWriter, r *http.Request) {
+	h.apiMigrationAction(w, r, migration.ActionForward)
+}
+
+func (h *Handler) apiMigrationAction(
+	w http.ResponseWriter,
+	r *http.Request,
+	action migration.ExecutionAction,
+) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+	migrationID, err := pathID(r, "migID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	var result *migration.Migration
+	switch action {
+	case migration.ActionRollback:
+		result, err = h.migrations.Rollback(r.Context(), userID, dbID, migrationID)
+	case migration.ActionForward:
+		result, err = h.migrations.Forward(r.Context(), userID, dbID, migrationID)
+	default:
+		h.handleAPIError(w, r, fmt.Errorf("%w: aksi migration tidak valid", apperr.ErrInvalidInput))
+		return
+	}
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, migrationActionResponse{
+		Migration: migrationDefinitionDTO{
+			ID:                 result.ID,
+			DatabaseID:         result.DatabaseID,
+			Version:            result.Version,
+			Title:              result.Title,
+			SQL:                result.SQL,
+			SQLDown:            result.SQLDown,
+			IsIrreversible:     result.IsIrreversible,
+			IrreversibleReason: result.IrreversibleReason,
+			Status:             result.Status,
+		},
+	})
+}
+
+type createMigrationResponse struct {
+	Migration migrationDefinitionDTO `json:"migration"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -480,6 +573,134 @@ func (h *Handler) apiTableData(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) apiCreateMigration(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	var request createMigrationRequest
+	if err := decoder.Decode(&request); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiErrorResponse{Error: "JSON request tidak valid atau terlalu besar"})
+		return
+	}
+
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, apiErrorResponse{Error: "request harus berisi satu objek JSON"})
+		return
+	}
+
+	created, err := h.migrations.Create(
+		r.Context(),
+		userID,
+		dbID,
+		request.Title,
+		request.SQL,
+		request.SQLDown,
+		request.IsIrreversible,
+		request.IrreversibleReason,
+	)
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, createMigrationResponse{
+		Migration: migrationDefinitionDTO{
+			ID:                 created.ID,
+			DatabaseID:         created.DatabaseID,
+			Version:            created.Version,
+			Title:              created.Title,
+			SQL:                created.SQL,
+			SQLDown:            created.SQLDown,
+			IsIrreversible:     created.IsIrreversible,
+			IrreversibleReason: created.IrreversibleReason,
+			Status:             created.Status,
+		},
+	})
+}
+
+func (h *Handler) apiUpdateMigration(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+	migrationID, err := pathID(r, "migID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	var request createMigrationRequest
+	if err := decoder.Decode(&request); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiErrorResponse{Error: "JSON request tidak valid atau terlalu besar"})
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, apiErrorResponse{Error: "request harus berisi satu objek JSON"})
+		return
+	}
+
+	if err := h.migrations.Update(
+		r.Context(),
+		userID,
+		dbID,
+		migrationID,
+		request.Title,
+		request.SQL,
+		request.SQLDown,
+		request.IsIrreversible,
+		request.IrreversibleReason,
+	); err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	updated, err := h.migrations.Get(r.Context(), userID, dbID, migrationID)
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, createMigrationResponse{
+		Migration: migrationDefinitionDTO{
+			ID:                 updated.ID,
+			DatabaseID:         updated.DatabaseID,
+			Version:            updated.Version,
+			Title:              updated.Title,
+			SQL:                updated.SQL,
+			SQLDown:            updated.SQLDown,
+			IsIrreversible:     updated.IsIrreversible,
+			IrreversibleReason: updated.IrreversibleReason,
+			Status:             updated.Status,
+		},
+	})
+}
+
 func (h *Handler) listSchemas(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.userID(w, r)
 	if !ok {
@@ -626,13 +847,44 @@ func (h *Handler) createMigration(w http.ResponseWriter, r *http.Request) {
 		h.handleError(w, r, err)
 		return
 	}
-	title, sqlText := r.FormValue("title"), r.FormValue("sql")
-	m, err := h.migrations.Create(r.Context(), userID, dbID, title, sqlText)
+	title := r.FormValue("title")
+	sqlUp := r.FormValue("sql")
+	sqlDown := r.FormValue("sql_down")
+	irreversibleReason := r.FormValue("irreversible_reason")
+
+	isIrreversible := false
+	if value := r.FormValue("is_irreversible"); value != "" {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			h.handleError(w, r, fmt.Errorf(
+				"%w: pilihan irreversible tidak valid",
+				apperr.ErrInvalidInput,
+			))
+			return
+		}
+		isIrreversible = parsed
+	}
+
+	m, err := h.migrations.Create(
+		r.Context(),
+		userID,
+		dbID,
+		title,
+		sqlUp,
+		sqlDown,
+		isIrreversible,
+		irreversibleReason,
+	)
 	if errors.Is(err, apperr.ErrInvalidInput) {
 		w.WriteHeader(http.StatusBadRequest)
 		h.render(w, "migration_form.html", map[string]any{
-			"DBID": dbID, "Title": title, "SQL": sqlText,
-			"Error": userMessage(err), "CSRFToken": h.csrfToken(r),
+			"DBID":               dbID,
+			"Title":              title,
+			"SQL":                sqlUp,
+			"SQLDown":            sqlDown,
+			"IsIrreversible":     isIrreversible,
+			"IrreversibleReason": irreversibleReason,
+			"Error":              userMessage(err), "CSRFToken": h.csrfToken(r),
 		})
 		return
 	}
@@ -725,14 +977,48 @@ func (h *Handler) updateMigration(w http.ResponseWriter, r *http.Request) {
 		h.handleError(w, r, err)
 		return
 	}
-	title, sqlText := r.FormValue("title"), r.FormValue("sql")
-	err := h.migrations.Update(r.Context(), userID, dbID, migrationID, title, sqlText)
+	title := r.FormValue("title")
+	sqlUp := r.FormValue("sql")
+	sqlDown := r.FormValue("sql_down")
+	irreversibleReason := r.FormValue("irreversible_reason")
+
+	isIrreversible := false
+	if value := r.FormValue("is_irreversible"); value != "" {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			h.handleError(w, r, fmt.Errorf(
+				"%w: pilihan irreversible tidak valid",
+				apperr.ErrInvalidInput,
+			))
+			return
+		}
+		isIrreversible = parsed
+	}
+
+	err := h.migrations.Update(
+		r.Context(),
+		userID,
+		dbID,
+		migrationID,
+		title,
+		sqlUp,
+		sqlDown,
+		isIrreversible,
+		irreversibleReason,
+	)
 	if errors.Is(err, apperr.ErrInvalidInput) {
 		w.WriteHeader(http.StatusBadRequest)
 		h.render(w, "migration_form.html", map[string]any{
-			"DBID": dbID, "Migration": &migration.Migration{ID: migrationID},
-			"Title": title, "SQL": sqlText, "Error": userMessage(err),
-			"CSRFToken": h.csrfToken(r), "Editing": true,
+			"DBID":               dbID,
+			"Migration":          &migration.Migration{ID: migrationID},
+			"Title":              title,
+			"SQL":                sqlUp,
+			"SQLDown":            sqlDown,
+			"IsIrreversible":     isIrreversible,
+			"IrreversibleReason": irreversibleReason,
+			"Error":              userMessage(err),
+			"CSRFToken":          h.csrfToken(r),
+			"Editing":            true,
 		})
 		return
 	}
