@@ -30,15 +30,22 @@ function Extract-CsrfToken {
     return ""
 }
 
+# Token CSRF sesi diambil dari GET /api/auth/me (JSON), bukan dari HTML.
+function Get-CsrfToken {
+    param ([string]$CookieFile)
+    $json = & curl.exe -s -b "$CookieFile" "$BaseUrl/api/auth/me"
+    try { return ($json | ConvertFrom-Json).csrf_token } catch { return "" }
+}
+
 function Login-User {
     param ([string]$Username, [string]$Password, [string]$CookieFile)
     if (Test-Path $CookieFile) { Remove-Item $CookieFile -Force }
     $payload = '{\"username\":\"' + $Username + '\",\"password\":\"' + $Password + '\"}'
-    $res = & curl.exe -s -c "$CookieFile" -H "Content-Type: application/json" -H "X-Requested-With: XMLHttpRequest" -X POST "$BaseUrl/login" -d $payload -w "%{http_code}" -o /dev/null
+    $res = & curl.exe -s -c "$CookieFile" -H "Content-Type: application/json" -H "X-Requested-With: XMLHttpRequest" -X POST "$BaseUrl/api/auth/login" -d $payload -w "%{http_code}" -o /dev/null
     return $res
 }
 
-Write-Host "=== Memulai Smoke Test Milestone 1 di $BaseUrl ===" -ForegroundColor Cyan
+Write-Host "=== Memulai Smoke Test Milestone 1 (+ API JSON Milestone 2) di $BaseUrl ===" -ForegroundColor Cyan
 
 # ----------------------------------------------------
 # 1. Tanpa cookie -> 401 Unauthorized
@@ -71,8 +78,7 @@ Report-Result -Name "3. Admin tanpa group -> 403 pada /databases/$DbTargetId" -P
 $cookieViewer = "$env:TEMP\cookie_viewer.txt"
 Login-User "viewer" "password123" $cookieViewer | Out-Null
 $code4Get = & curl.exe -s -b $cookieViewer -o /dev/null -w "%{http_code}" "$BaseUrl/databases/$DbTargetId"
-$dashHtmlViewer = & curl.exe -s -b $cookieViewer "$BaseUrl/dashboard"
-$csrfViewer = Extract-CsrfToken $dashHtmlViewer
+$csrfViewer = Get-CsrfToken $cookieViewer
 
 $postViewer = "csrf_token=$csrfViewer&title=ForbiddenMig&sql=SELECT+1;"
 $code4Post = & curl.exe -s -b $cookieViewer -o /dev/null -w "%{http_code}" -X POST "$BaseUrl/databases/$DbTargetId/migrations" -d $postViewer
@@ -84,8 +90,7 @@ Report-Result -Name "4. Viewer: GET 200, POST create migration -> 403" -Passed $
 # ----------------------------------------------------
 $cookieEditor = "$env:TEMP\cookie_editor.txt"
 Login-User "editor" "password123" $cookieEditor | Out-Null
-$dashHtmlEditor = & curl.exe -s -b $cookieEditor "$BaseUrl/dashboard"
-$csrfEditor = Extract-CsrfToken $dashHtmlEditor
+$csrfEditor = Get-CsrfToken $cookieEditor
 
 # 5a. Buat migrasi valid A
 $migNameA = "smoke_tbl_a_" + (Get-Random -Minimum 1000 -Maximum 9999)
@@ -159,11 +164,9 @@ Report-Result -Name "8. POST tanpa CSRF -> 403" -Passed ($code8 -eq "403") -Deta
 # ----------------------------------------------------
 $cookieLogout = "$env:TEMP\cookie_logout.txt"
 Login-User "editor" "password123" $cookieLogout | Out-Null
-$dashHtmlLogout = & curl.exe -s -b "$cookieLogout" "$BaseUrl/dashboard"
-$csrfLogout = Extract-CsrfToken $dashHtmlLogout
+$csrfLogout = Get-CsrfToken $cookieLogout
 
-$logoutPost = "csrf_token=$csrfLogout"
-$code9Logout = & curl.exe -s -b "$cookieLogout" -c "$cookieLogout" -o /dev/null -w "%{http_code}" -X POST "$BaseUrl/logout" -d $logoutPost
+$code9Logout = & curl.exe -s -b "$cookieLogout" -c "$cookieLogout" -o /dev/null -w "%{http_code}" -X POST "$BaseUrl/api/auth/logout" -H "X-CSRF-Token: $csrfLogout"
 $code9Replay = & curl.exe -s -b "$cookieLogout" -o /dev/null -w "%{http_code}" "$BaseUrl/dashboard"
 $pass9 = ($code9Replay -eq "401")
 Report-Result -Name "9. Logout lalu replay cookie lama -> 401" -Passed $pass9 -Detail "Replay returned HTTP $code9Replay"
@@ -173,25 +176,21 @@ Report-Result -Name "9. Logout lalu replay cookie lama -> 401" -Passed $pass9 -D
 # ----------------------------------------------------
 $cookieTemp = "$env:TEMP\cookie_temp_user.txt"
 Login-User "outsider" "password123" $cookieTemp | Out-Null
-$dashHtmlAdmin = & curl.exe -s -b $cookieAdmin "$BaseUrl/admin"
-$csrfAdmin = Extract-CsrfToken $dashHtmlAdmin
+$csrfAdmin = Get-CsrfToken $cookieAdmin
 
-# Cari User ID outsider dari HTML admin
+# Cari ID user outsider lewat GET /api/admin/users
+$usersJson = & curl.exe -s -b $cookieAdmin "$BaseUrl/api/admin/users"
 $outsiderId = 4
-if ($dashHtmlAdmin -match '<td><strong>outsider</strong></td>[\s\S]*?<input type="hidden" name="user_id" value="(\d+)">') {
-    $outsiderId = [int]$Matches[1]
-}
+try { $outsiderId = [int](($usersJson | ConvertFrom-Json) | Where-Object { $_.username -eq "outsider" } | Select-Object -First 1).id } catch {}
 
-# Admin nonaktifkan outsider
-$postDeact = "csrf_token=$csrfAdmin&user_id=$outsiderId&action=deactivate"
-& curl.exe -s -b $cookieAdmin -o /dev/null -X POST "$BaseUrl/admin/users/status" -d $postDeact
+# Admin nonaktifkan outsider (PATCH JSON + header CSRF)
+& curl.exe -s -b $cookieAdmin -o /dev/null -X PATCH "$BaseUrl/api/admin/users/$outsiderId/status" -H "Content-Type: application/json" -H "X-CSRF-Token: $csrfAdmin" -d '{\"is_active\":false}'
 
 # Sesi aktif outsider harus langsung ditolak 401
 $code10Deact = & curl.exe -s -b $cookieTemp -o /dev/null -w "%{http_code}" "$BaseUrl/dashboard"
 
 # Aktifkan kembali agar skrip dapat diulang
-$postAct = "csrf_token=$csrfAdmin&user_id=$outsiderId&action=activate"
-& curl.exe -s -b $cookieAdmin -o /dev/null -X POST "$BaseUrl/admin/users/status" -d $postAct
+& curl.exe -s -b $cookieAdmin -o /dev/null -X PATCH "$BaseUrl/api/admin/users/$outsiderId/status" -H "Content-Type: application/json" -H "X-CSRF-Token: $csrfAdmin" -d '{\"is_active\":true}'
 
 $pass10 = ($code10Deact -eq "401")
 Report-Result -Name "10. Admin menonaktifkan user -> session langsung 401" -Passed $pass10 -Detail "Session check returned HTTP $code10Deact"
