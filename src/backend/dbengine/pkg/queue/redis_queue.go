@@ -33,10 +33,11 @@ type Queue interface {
 }
 
 type RedisQueue struct {
-	addr     string
-	password string
-	queueKey string
+	addr        string
+	password    string
+	queueKey    string
 	dialTimeout time.Duration
+	dialFunc    func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 func NewRedisQueue(addr, password, queueKey string) *RedisQueue {
@@ -145,8 +146,16 @@ func (rq *RedisQueue) Close() error {
 }
 
 func (rq *RedisQueue) dial(ctx context.Context) (net.Conn, *bufio.Reader, error) {
-	dialer := net.Dialer{Timeout: rq.dialTimeout}
-	conn, err := dialer.DialContext(ctx, "tcp", rq.addr)
+	var (
+		conn net.Conn
+		err  error
+	)
+	if rq.dialFunc != nil {
+		conn, err = rq.dialFunc(ctx, "tcp", rq.addr)
+	} else {
+		dialer := net.Dialer{Timeout: rq.dialTimeout}
+		conn, err = dialer.DialContext(ctx, "tcp", rq.addr)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
