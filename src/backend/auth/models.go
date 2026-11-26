@@ -22,3 +22,8 @@ type Session struct {
 	PreviousID         string    `json:"-"`
 	PreviousValidUntil time.Time `json:"-"`
 }
+
+type LeaderGroup struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}

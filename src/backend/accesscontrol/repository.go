@@ -7,6 +7,7 @@ type AccessRepository interface {
 	CreateUser(user *User) error
 	CreateUserWithPassword(username string, passwordHash string, isAdmin bool) (*User, error)
 	SetUserActive(userID int, isActive bool) error
+	SetUserAdmin(userID int, isAdmin bool) error
 	GetActiveAdminCount() (int, error)
 
 	GetGroup(groupID int) (*Group, error)
@@ -19,6 +20,10 @@ type AccessRepository interface {
 	GetGroupMembers(groupID int) ([]User, error)
 	GetGroupGrants(groupID int) ([]GroupDatabaseGrant, error)
 
+	IsGroupMember(userID, groupID int) (bool, error)
+	SetGroupLeader(groupID, userID int) error
+	GetLeaderGroups(userID int) ([]Group, error)
+	
 	GetDatabase(dbID int) (*Database, error)
 	GetAllDatabases() ([]Database, error)
 	CreateDatabase(db *Database) error

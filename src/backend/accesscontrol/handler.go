@@ -174,7 +174,7 @@ func (h *AdminHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		serverError(w, r, "gagal hash password", err)
 		return
 	}
-	u, err = h.repo.CreateUserWithPassword(req.Username, string(hash), req.IsAdmin)
+	u, err := h.repo.CreateUserWithPassword(req.Username, string(hash), req.IsAdmin)
 	if err != nil {
 		if isUniqueViolation(err) {
 			auth.WriteError(w, http.StatusConflict, "username sudah digunakan")

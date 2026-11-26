@@ -43,6 +43,8 @@ type UserWithGroups struct {
 type Group struct {
 	ID   int    `json:"id"`
 	Name string `json:"name"`
+	LeaderID       *int   `json:"leader_id"`
+	LeaderUsername string `json:"leader_username,omitempty"`
 }
 
 type Database struct {
@@ -69,6 +71,8 @@ type GroupAccess struct {
 }
 
 var (
+	ErrInvalidInput  = errors.New("input tidak valid")
+	ErrConflict      = errors.New("operasi bertentangan dengan keadaan saat ini")
 	ErrUnauthorized = errors.New("pengguna tidak memiliki akses")
 	ErrNotAdmin     = errors.New("hanya Platform Admin yang dapat melakukan aksi ini")
 	ErrNotFound     = errors.New("data tidak ditemukan")

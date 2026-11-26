@@ -134,3 +134,13 @@ func (m *Manager) Close() {
 		delete(m.pools, id)
 	}
 }
+
+func (m *Manager) Pools() []*pgxpool.Pool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*pgxpool.Pool, 0, len(m.pools))
+	for _, p := range m.pools {
+		out = append(out, p)
+	}
+	return out
+}

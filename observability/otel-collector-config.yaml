@@ -1,0 +1,45 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  filelog:
+    include: [/var/log/backend/*.log]
+    start_at: beginning
+    operators:
+      - type: json_parser
+        timestamp:
+          parse_from: attributes.time
+          layout_type: gotime
+          layout: "2006-01-02T15:04:05.999999999Z07:00"
+        severity:
+          parse_from: attributes.level
+      - type: trace_parser          # korelasi log <-> trace lewat trace_id/span_id pada log JSON
+        trace_id:
+          parse_from: attributes.trace_id
+        span_id:
+          parse_from: attributes.span_id
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: basic
+  file/traces:
+    path: /var/lib/otelcol/traces.jsonl
+  file/logs:
+    path: /var/lib/otelcol/logs.jsonl
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, file/traces]
+    logs:
+      receivers: [filelog, otlp]
+      processors: [batch]
+      exporters: [debug, file/logs]

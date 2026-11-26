@@ -62,6 +62,11 @@ func (r *postgresRepository) CreateUserWithPassword(username string, passwordHas
 	return u, nil
 }
 
+func (r *postgresRepository) SetUserAdmin(userID int, isAdmin bool) error {
+	_, err := r.db.Exec("UPDATE users SET is_admin = $1 WHERE id = $2", isAdmin, userID)
+	return err
+}
+
 func (r *postgresRepository) SetUserActive(userID int, isActive bool) error {
 	_, err := r.db.Exec("UPDATE users SET is_active = $1 WHERE id = $2", isActive, userID)
 	return err
@@ -75,15 +80,27 @@ func (r *postgresRepository) GetActiveAdminCount() (int, error) {
 
 func (r *postgresRepository) GetGroup(groupID int) (*Group, error) {
 	g := &Group{}
-	err := r.db.QueryRow("SELECT id, name FROM groups WHERE id = $1", groupID).Scan(&g.ID, &g.Name)
+	var leaderID sql.NullInt64
+	var leaderName sql.NullString
+	err := r.db.QueryRow(`
+		SELECT g.id, g.name, g.leader_id, u.username
+		FROM groups g LEFT JOIN users u ON u.id = g.leader_id
+		WHERE g.id = $1`, groupID).Scan(&g.ID, &g.Name, &leaderID, &leaderName)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
-	return g, err
+	if err != nil {
+		return nil, err
+	}
+	applyLeader(g, leaderID, leaderName)
+	return g, nil
 }
 
 func (r *postgresRepository) GetAllGroups() ([]Group, error) {
-	rows, err := r.db.Query("SELECT id, name FROM groups")
+	rows, err := r.db.Query(`
+		SELECT g.id, g.name, g.leader_id, u.username
+		FROM groups g LEFT JOIN users u ON u.id = g.leader_id
+		ORDER BY g.id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -92,12 +109,15 @@ func (r *postgresRepository) GetAllGroups() ([]Group, error) {
 	var groups []Group
 	for rows.Next() {
 		var g Group
-		if err := rows.Scan(&g.ID, &g.Name); err != nil {
+		var leaderID sql.NullInt64
+		var leaderName sql.NullString
+		if err := rows.Scan(&g.ID, &g.Name, &leaderID, &leaderName); err != nil {
 			return nil, err
 		}
+		applyLeader(&g, leaderID, leaderName)
 		groups = append(groups, g)
 	}
-	return groups, nil
+	return groups, rows.Err()
 }
 
 func (r *postgresRepository) CreateGroup(name string) (*Group, error) {
@@ -111,10 +131,12 @@ func (r *postgresRepository) CreateGroup(name string) (*Group, error) {
 
 func (r *postgresRepository) GetGroupsByUserID(userID int) ([]Group, error) {
 	rows, err := r.db.Query(`
-		SELECT g.id, g.name 
+		SELECT g.id, g.name, g.leader_id, lu.username
 		FROM groups g
 		JOIN user_groups ug ON g.id = ug.group_id
+		LEFT JOIN users lu ON lu.id = g.leader_id
 		WHERE ug.user_id = $1
+		ORDER BY g.id ASC
 	`, userID)
 	if err != nil {
 		return nil, err
@@ -124,12 +146,15 @@ func (r *postgresRepository) GetGroupsByUserID(userID int) ([]Group, error) {
 	var groups []Group
 	for rows.Next() {
 		var g Group
-		if err := rows.Scan(&g.ID, &g.Name); err != nil {
+		var leaderID sql.NullInt64
+		var leaderName sql.NullString
+		if err := rows.Scan(&g.ID, &g.Name, &leaderID, &leaderName); err != nil {
 			return nil, err
 		}
+		applyLeader(&g, leaderID, leaderName)
 		groups = append(groups, g)
 	}
-	return groups, nil
+	return groups, rows.Err()
 }
 
 func (r *postgresRepository) AddUserToGroup(userID, groupID int) error {
@@ -297,4 +322,48 @@ func (r *postgresRepository) GetGroupGrants(groupID int) ([]GroupDatabaseGrant, 
 		grants = append(grants, g)
 	}
 	return grants, nil
+}
+
+func applyLeader(g *Group, id sql.NullInt64, name sql.NullString) {
+	if id.Valid {
+		v := int(id.Int64)
+		g.LeaderID = &v
+		g.LeaderUsername = name.String
+	}
+}
+
+func (r *postgresRepository) IsGroupMember(userID, groupID int) (bool, error) {
+	var ok bool
+	err := r.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM user_groups WHERE user_id = $1 AND group_id = $2)`, userID, groupID).Scan(&ok)
+	return ok, err
+}
+
+func (r *postgresRepository) SetGroupLeader(groupID, userID int) error {
+	res, err := r.db.Exec(`UPDATE groups SET leader_id = $2 WHERE id = $1`, groupID, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *postgresRepository) GetLeaderGroups(userID int) ([]Group, error) {
+	rows, err := r.db.Query(`SELECT id, name FROM groups WHERE leader_id = $1 ORDER BY id ASC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var groups []Group
+	for rows.Next() {
+		var g Group
+		if err := rows.Scan(&g.ID, &g.Name); err != nil {
+			return nil, err
+		}
+		id := userID
+		g.LeaderID = &id
+		groups = append(groups, g)
+	}
+	return groups, rows.Err()
 }
