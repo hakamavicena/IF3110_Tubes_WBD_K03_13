@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"backend/dbengine/pkg/apperr"
 	"backend/dbengine/pkg/dbviewer"
@@ -77,6 +78,7 @@ func (h *Handler) Register(mux *http.ServeMux, protect func(http.Handler) http.H
 	route("GET /api/databases/{dbID}/schemas/{schema}/tables", h.apiListTables)
 	route("GET /api/databases/{dbID}/schemas/{schema}/tables/{table}", h.apiTableDetail)
 	route("GET /api/databases/{dbID}/schemas/{schema}/tables/{table}/data", h.apiTableData)
+	route("GET /api/databases/{dbID}/history", h.apiMigrationHistory)
 	route("GET /databases/{dbID}", h.listSchemas)
 	route("GET /databases/{dbID}/schemas/{schema}/tables", h.listTables)
 	route("GET /databases/{dbID}/schemas/{schema}/tables/{table}", h.tableDetail)
@@ -274,6 +276,91 @@ type migrationDefinitionDTO struct {
 
 type migrationActionResponse struct {
 	Migration migrationDefinitionDTO `json:"migration"`
+}
+
+type migrationExecutionDTO struct {
+	ExecutionID         int64                     `json:"execution_id"`
+	DatabaseID          int64                     `json:"database_id"`
+	MigrationID         int64                     `json:"migration_id"`
+	JobID               *int64                    `json:"job_id"`
+	Version             int                       `json:"version"`
+	Revision            int                       `json:"revision"`
+	Title               string                    `json:"title"`
+	Action              migration.ExecutionAction `json:"action"`
+	SQLExecuted         string                    `json:"sql_executed"`
+	ExecutedBy          int64                     `json:"executed_by"`
+	ExecutedByName      string                    `json:"executed_by_name"`
+	ExecutedAt          time.Time                 `json:"executed_at"`
+	DurationMs          int                       `json:"duration_ms"`
+	RowsAffected        int64                     `json:"rows_affected"`
+	Status              migration.Status          `json:"status"`
+	RevertedExecutionID *int64                    `json:"reverted_execution_id"`
+}
+
+type migrationHistoryResponse struct {
+	History []migrationExecutionDTO `json:"history"`
+}
+
+func (h *Handler) apiMigrationHistory(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	hideRollback := false
+	if value, present := r.URL.Query()["hide_rollback"]; present {
+		if len(value) != 1 {
+			h.handleAPIError(w, r, fmt.Errorf(
+				"%w: parameter hide_rollback tidak valid",
+				apperr.ErrInvalidInput,
+			))
+			return
+		}
+		hideRollback, err = strconv.ParseBool(value[0])
+		if err != nil {
+			h.handleAPIError(w, r, fmt.Errorf(
+				"%w: parameter hide_rollback tidak valid",
+				apperr.ErrInvalidInput,
+			))
+			return
+		}
+	}
+
+	executions, err := h.migrations.History(r.Context(), userID, dbID, hideRollback)
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	history := make([]migrationExecutionDTO, 0, len(executions))
+	for _, execution := range executions {
+		history = append(history, migrationExecutionDTO{
+			ExecutionID:         execution.ExecutionID,
+			DatabaseID:          execution.DatabaseID,
+			MigrationID:         execution.MigrationID,
+			JobID:               execution.JobID,
+			Version:             execution.Version,
+			Revision:            execution.Revision,
+			Title:               execution.Title,
+			Action:              execution.Action,
+			SQLExecuted:         execution.SQLExecuted,
+			ExecutedBy:          execution.ExecutedBy,
+			ExecutedByName:      execution.ExecutedByName,
+			ExecutedAt:          execution.ExecutedAt,
+			DurationMs:          execution.DurationMs,
+			RowsAffected:        execution.RowsAffected,
+			Status:              execution.Status,
+			RevertedExecutionID: execution.RevertedExecutionID,
+		})
+	}
+	writeJSON(w, http.StatusOK, migrationHistoryResponse{History: history})
 }
 
 func (h *Handler) apiRollbackMigration(w http.ResponseWriter, r *http.Request) {

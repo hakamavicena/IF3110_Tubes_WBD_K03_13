@@ -27,6 +27,7 @@ type Repository interface {
 	Finish(ctx context.Context, id int64, status Status, errMsg string, durationMs int) error
 	RecoverStuck(ctx context.Context) (int64, error)
 	RecordExecution(ctx context.Context, execution *Execution) (*Execution, error)
+	ListHistory(ctx context.Context, databaseID int64) ([]Execution, error)
 	ClaimRollback(
 		ctx context.Context,
 		id, databaseID int64,
@@ -221,6 +222,58 @@ func (r *PGRepository) RecordExecution(
 		return nil, err
 	}
 	return execution, nil
+}
+
+func (r *PGRepository) ListHistory(
+	ctx context.Context,
+	databaseID int64,
+) ([]Execution, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT h.execution_id, h.database_id, h.migration_id, h.job_id,
+		       h.version, h.revision, h.title, h.action, h.sql_executed,
+		       h.executed_by, u.username, h.executed_at, h.duration_ms,
+		       h.rows_affected, h.status, h.reverted_execution_id
+		FROM migration_history h
+		JOIN users u ON u.id = h.executed_by
+		WHERE h.database_id = $1
+		ORDER BY h.execution_id`, databaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	executions := make([]Execution, 0)
+	for rows.Next() {
+		var execution Execution
+		var action, status string
+		if err := rows.Scan(
+			&execution.ExecutionID,
+			&execution.DatabaseID,
+			&execution.MigrationID,
+			&execution.JobID,
+			&execution.Version,
+			&execution.Revision,
+			&execution.Title,
+			&action,
+			&execution.SQLExecuted,
+			&execution.ExecutedBy,
+			&execution.ExecutedByName,
+			&execution.ExecutedAt,
+			&execution.DurationMs,
+			&execution.RowsAffected,
+			&status,
+			&execution.RevertedExecutionID,
+		); err != nil {
+			return nil, err
+		}
+		execution.Action = ExecutionAction(action)
+		execution.Status = Status(status)
+		executions = append(executions, execution)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return executions, nil
 }
 
 func (r *PGRepository) UpdateDraft(

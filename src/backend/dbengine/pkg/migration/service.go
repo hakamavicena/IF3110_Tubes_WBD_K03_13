@@ -63,6 +63,21 @@ func (s *Service) List(ctx context.Context, userID, dbID int64) ([]Migration, er
 	return s.repo.List(ctx, dbID)
 }
 
+func (s *Service) History(
+	ctx context.Context,
+	userID, dbID int64,
+	hideRollback bool,
+) ([]Execution, error) {
+	if err := s.requireView(ctx, userID, dbID); err != nil {
+		return nil, err
+	}
+	executions, err := s.repo.ListHistory(ctx, dbID)
+	if err != nil {
+		return nil, err
+	}
+	return FilterHistory(executions, hideRollback), nil
+}
+
 func (s *Service) Get(ctx context.Context, userID, dbID, migrationID int64) (*Migration, error) {
 	if err := s.requireView(ctx, userID, dbID); err != nil {
 		return nil, err

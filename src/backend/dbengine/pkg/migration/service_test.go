@@ -36,6 +36,8 @@ func (r serviceTestRunner) Run(context.Context, *pgxpool.Pool, string) error { r
 
 type serviceTestRepo struct {
 	migration           *Migration
+	history             []Execution
+	historyDatabaseID   int64
 	finished            bool
 	execution           *Execution
 	rollbackSQL         string
@@ -57,6 +59,11 @@ func (r *serviceTestRepo) Get(context.Context, int64) (*Migration, error) {
 	return &copy, nil
 }
 func (r *serviceTestRepo) List(context.Context, int64) ([]Migration, error) { return nil, nil }
+
+func (r *serviceTestRepo) ListHistory(_ context.Context, databaseID int64) ([]Execution, error) {
+	r.historyDatabaseID = databaseID
+	return r.history, nil
+}
 
 func (r *serviceTestRepo) RecordExecution(
 	ctx context.Context,
@@ -99,6 +106,76 @@ func TestGetHidesMigrationFromOtherDatabase(t *testing.T) {
 	if _, err := svc.Get(context.Background(), 1, 10, 5); !errors.Is(err, apperr.ErrNotFound) {
 		t.Fatalf("expected not found for cross-database migration, got %v", err)
 	}
+}
+
+func TestHistoryFiltersSuccessfulRollbackPairsByExecutionID(t *testing.T) {
+	revertedID := int64(2)
+	failedRollbackTarget := int64(4)
+	history := []Execution{
+		{ExecutionID: 1, Action: ActionApply, Status: StatusSuccess},
+		{ExecutionID: 2, Action: ActionApply, Status: StatusSuccess},
+		{
+			ExecutionID:         3,
+			Action:              ActionRollback,
+			Status:              StatusSuccess,
+			RevertedExecutionID: &revertedID,
+		},
+		{
+			ExecutionID:         4,
+			Action:              ActionForward,
+			Status:              StatusSuccess,
+			RevertedExecutionID: ptrInt64(3),
+		},
+		{ExecutionID: 5, Action: ActionApply, Status: StatusFailed},
+		{
+			ExecutionID:         6,
+			Action:              ActionRollback,
+			Status:              StatusFailed,
+			RevertedExecutionID: &failedRollbackTarget,
+		},
+	}
+
+	got := FilterHistory(history, true)
+	wantIDs := []int64{1, 4, 5, 6}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("filtered history has %d entries, want %d: %+v", len(got), len(wantIDs), got)
+	}
+	for i, wantID := range wantIDs {
+		if got[i].ExecutionID != wantID {
+			t.Errorf("filtered history[%d].ExecutionID = %d, want %d",
+				i, got[i].ExecutionID, wantID)
+		}
+	}
+
+	unfiltered := FilterHistory(history, false)
+	if len(unfiltered) != len(history) {
+		t.Fatalf("unfiltered history has %d entries, want %d", len(unfiltered), len(history))
+	}
+}
+
+func TestHistoryRequiresViewAndScopesRepositoryQuery(t *testing.T) {
+	repo := &serviceTestRepo{history: []Execution{{ExecutionID: 1}}}
+	svc := NewService(repo, serviceTestAuth{view: true}, serviceTestPools{}, serviceTestRunner{}, time.Second)
+
+	got, err := svc.History(context.Background(), 7, 10, false)
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+	if repo.historyDatabaseID != 10 {
+		t.Fatalf("history database ID = %d, want 10", repo.historyDatabaseID)
+	}
+	if len(got) != 1 || got[0].ExecutionID != 1 {
+		t.Fatalf("History() = %+v, want execution 1", got)
+	}
+
+	svc = NewService(repo, serviceTestAuth{view: false}, serviceTestPools{}, serviceTestRunner{}, time.Second)
+	if _, err := svc.History(context.Background(), 7, 10, false); !errors.Is(err, apperr.ErrForbidden) {
+		t.Fatalf("History() without view access error = %v, want forbidden", err)
+	}
+}
+
+func ptrInt64(value int64) *int64 {
+	return &value
 }
 
 func TestExecuteRequiresEditBeforeLoadingMigration(t *testing.T) {

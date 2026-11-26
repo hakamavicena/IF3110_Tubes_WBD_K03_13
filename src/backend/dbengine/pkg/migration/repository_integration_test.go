@@ -73,6 +73,15 @@ func integrationRepository(t *testing.T) (*PGRepository, *pgxpool.Pool) {
 		status TEXT NOT NULL DEFAULT 'success'
 			CHECK (status IN ('success', 'failed')),
 		reverted_execution_id BIGINT REFERENCES migration_history(execution_id));
+		CREATE OR REPLACE FUNCTION prevent_history_modification()
+		RETURNS TRIGGER AS $$
+		BEGIN
+			RAISE EXCEPTION 'migration_history is immutable';
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER trg_immutable_migration_history
+		BEFORE UPDATE OR DELETE ON migration_history
+		FOR EACH ROW EXECUTE FUNCTION prevent_history_modification();
 		INSERT INTO users (id, username) VALUES (1, 'tester');
 		INSERT INTO database_targets (id, name, host, database_name, username, password_enc)
 		VALUES (1, 'target', 'localhost', 'target', 'tester', decode('00','hex'));`, pgx.QueryExecModeSimpleProtocol)
@@ -281,6 +290,203 @@ func TestRepositoryClaimRollbackOnlyLatestActiveMigration(t *testing.T) {
 	}
 }
 
+func TestRepositoryRollbackAndForwardFollowLinearOrder(t *testing.T) {
+	repo, pool := integrationRepository(t)
+	ctx := context.Background()
+
+	migrations := make([]*Migration, 3)
+	applied := make([]*Execution, 3)
+	rolledBack := make([]*Execution, 3)
+	forwarded := make([]*Execution, 3)
+
+	for i := range migrations {
+		version := i + 1
+		item, err := repo.Create(ctx, &Migration{
+			DatabaseID: 1,
+			Title:      fmt.Sprintf("migration %d", version),
+			SQL:        fmt.Sprintf("SELECT %d", version),
+			SQLDown:    fmt.Sprintf("SELECT %d", version+10),
+			CreatedBy:  1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		migrations[i] = item
+	}
+
+	recordSuccess := func(
+		item *Migration,
+		action ExecutionAction,
+		sql string,
+		revertedExecutionID *int64,
+	) *Execution {
+		t.Helper()
+
+		execution, err := repo.RecordExecution(ctx, &Execution{
+			DatabaseID:          1,
+			MigrationID:         item.ID,
+			Version:             item.Version,
+			Revision:            1,
+			Title:               item.Title,
+			Action:              action,
+			SQLExecuted:         sql,
+			ExecutedBy:          1,
+			Status:              StatusSuccess,
+			RevertedExecutionID: revertedExecutionID,
+		})
+		if err != nil {
+			t.Fatalf("record %s execution for version %d: %v", action, item.Version, err)
+		}
+		return execution
+	}
+
+	// Apply A, B, C in order so all three are active.
+	for i, item := range migrations {
+		sqlUp, claimed, err := repo.Claim(ctx, item.ID, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !claimed {
+			t.Fatalf("version %d was not claimable for apply", item.Version)
+		}
+		if sqlUp != item.SQL {
+			t.Fatalf("apply SQL = %q, want %q", sqlUp, item.SQL)
+		}
+
+		if err := repo.Finish(ctx, item.ID, StatusSuccess, "", 1); err != nil {
+			t.Fatal(err)
+		}
+		applied[i] = recordSuccess(item, ActionApply, sqlUp, nil)
+	}
+
+	// B must not be rollback-claimable while C is still active.
+	if _, _, claimed, err := repo.ClaimRollback(ctx, migrations[1].ID, 1); err != nil {
+		t.Fatal(err)
+	} else if claimed {
+		t.Fatal("version B was claimable while version C was active")
+	}
+
+	// Roll back C, then B, then A.
+	for i := len(migrations) - 1; i >= 0; i-- {
+		item := migrations[i]
+		sqlDown, revertedID, claimed, err := repo.ClaimRollback(ctx, item.ID, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !claimed {
+			t.Fatalf("version %d was not claimable for rollback", item.Version)
+		}
+		if sqlDown != item.SQLDown {
+			t.Errorf("rollback SQL for version %d = %q, want %q",
+				item.Version, sqlDown, item.SQLDown)
+		}
+		if revertedID != applied[i].ExecutionID {
+			t.Errorf("rollback of version %d references execution %d, want %d",
+				item.Version, revertedID, applied[i].ExecutionID)
+		}
+
+		if err := repo.Finish(ctx, item.ID, StatusSuccess, "", 1); err != nil {
+			t.Fatal(err)
+		}
+		revertedExecutionID := revertedID
+		rolledBack[i] = recordSuccess(
+			item,
+			ActionRollback,
+			sqlDown,
+			&revertedExecutionID,
+		)
+	}
+
+	// C must not be forward-claimable while A and B remain rolled back.
+	if _, _, claimed, err := repo.ClaimForward(ctx, migrations[2].ID, 1); err != nil {
+		t.Fatal(err)
+	} else if claimed {
+		t.Fatal("version C was claimable before versions A and B were forwarded")
+	}
+
+	// Forward A, then B, then C.
+	for i, item := range migrations {
+		sqlUp, rollbackExecutionID, claimed, err := repo.ClaimForward(ctx, item.ID, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !claimed {
+			t.Fatalf("version %d was not claimable for forward", item.Version)
+		}
+		if sqlUp != item.SQL {
+			t.Errorf("forward SQL for version %d = %q, want %q",
+				item.Version, sqlUp, item.SQL)
+		}
+		if rollbackExecutionID != rolledBack[i].ExecutionID {
+			t.Errorf("forward of version %d references rollback execution %d, want %d",
+				item.Version, rollbackExecutionID, rolledBack[i].ExecutionID)
+		}
+
+		if err := repo.Finish(ctx, item.ID, StatusSuccess, "", 1); err != nil {
+			t.Fatal(err)
+		}
+		revertedExecutionID := rollbackExecutionID
+		forwarded[i] = recordSuccess(
+			item,
+			ActionForward,
+			sqlUp,
+			&revertedExecutionID,
+		)
+	}
+
+	// Check final active state and history order.
+	for i, item := range migrations {
+		var activeState string
+		var activeExecutionID int64
+		if err := pool.QueryRow(ctx, `
+            SELECT active_state, active_execution_id
+            FROM migrations
+            WHERE id = $1`,
+			item.ID,
+		).Scan(&activeState, &activeExecutionID); err != nil {
+			t.Fatal(err)
+		}
+
+		if activeState != "applied" {
+			t.Errorf("version %d active_state = %q, want applied",
+				item.Version, activeState)
+		}
+		if activeExecutionID != forwarded[i].ExecutionID {
+			t.Errorf("version %d active_execution_id = %d, want %d",
+				item.Version, activeExecutionID, forwarded[i].ExecutionID)
+		}
+	}
+
+	history, err := repo.ListHistory(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 9 {
+		t.Fatalf("history entries = %d, want 9", len(history))
+	}
+
+	wantActions := []ExecutionAction{
+		ActionApply, ActionApply, ActionApply,
+		ActionRollback, ActionRollback, ActionRollback,
+		ActionForward, ActionForward, ActionForward,
+	}
+	wantMigrationIDs := []int64{
+		migrations[0].ID, migrations[1].ID, migrations[2].ID,
+		migrations[2].ID, migrations[1].ID, migrations[0].ID,
+		migrations[0].ID, migrations[1].ID, migrations[2].ID,
+	}
+	for i, execution := range history {
+		if execution.Action != wantActions[i] {
+			t.Errorf("history[%d].Action = %q, want %q",
+				i, execution.Action, wantActions[i])
+		}
+		if execution.MigrationID != wantMigrationIDs[i] {
+			t.Errorf("history[%d].MigrationID = %d, want %d",
+				i, execution.MigrationID, wantMigrationIDs[i])
+		}
+	}
+}
+
 func TestRepositoryClaimRollbackRejectsIrreversibleMigration(t *testing.T) {
 	repo, pool := integrationRepository(t)
 	ctx := context.Background()
@@ -396,5 +602,82 @@ func TestRepositoryRecordExecutionApplyRollbackForward(t *testing.T) {
 	if activeExecutionID != forwarded.ExecutionID {
 		t.Errorf("active_execution_id = %d, want %d",
 			activeExecutionID, forwarded.ExecutionID)
+	}
+}
+
+func TestRepositoryListsFailedAttemptsAndKeepsHistoryImmutable(t *testing.T) {
+	repo, pool := integrationRepository(t)
+	ctx := context.Background()
+
+	item, err := repo.Create(ctx, &Migration{
+		DatabaseID: 1,
+		Title:      "create items",
+		SQL:        "CREATE TABLE items (id INT)",
+		SQLDown:    "DROP TABLE items",
+		CreatedBy:  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	applied, err := repo.RecordExecution(ctx, &Execution{
+		DatabaseID:  1,
+		MigrationID: item.ID,
+		Version:     item.Version,
+		Revision:    1,
+		Title:       item.Title,
+		Action:      ActionApply,
+		SQLExecuted: item.SQL,
+		ExecutedBy:  1,
+		Status:      StatusSuccess,
+	})
+	if err != nil {
+		t.Fatalf("record successful execution: %v", err)
+	}
+
+	failed, err := repo.RecordExecution(ctx, &Execution{
+		DatabaseID:          1,
+		MigrationID:         item.ID,
+		Version:             item.Version,
+		Revision:            1,
+		Title:               item.Title,
+		Action:              ActionRollback,
+		SQLExecuted:         item.SQLDown,
+		ExecutedBy:          1,
+		Status:              StatusFailed,
+		RevertedExecutionID: &applied.ExecutionID,
+	})
+	if err != nil {
+		t.Fatalf("record failed execution attempt: %v", err)
+	}
+
+	history, err := repo.ListHistory(ctx, 1)
+	if err != nil {
+		t.Fatalf("list migration history: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history has %d entries, want 2", len(history))
+	}
+	if history[0].ExecutionID != applied.ExecutionID ||
+		history[1].ExecutionID != failed.ExecutionID {
+		t.Fatalf("history order = [%d, %d], want [%d, %d]",
+			history[0].ExecutionID, history[1].ExecutionID,
+			applied.ExecutionID, failed.ExecutionID)
+	}
+	if history[1].Status != StatusFailed ||
+		history[1].SQLExecuted != item.SQLDown ||
+		history[1].ExecutedByName != "tester" ||
+		history[1].RevertedExecutionID == nil ||
+		*history[1].RevertedExecutionID != applied.ExecutionID {
+		t.Fatalf("failed history attempt has incorrect snapshot or metadata: %+v", history[1])
+	}
+
+	for _, query := range []string{
+		"UPDATE migration_history SET title='changed' WHERE execution_id=$1",
+		"DELETE FROM migration_history WHERE execution_id=$1",
+	} {
+		if _, err := pool.Exec(ctx, query, applied.ExecutionID); err == nil {
+			t.Errorf("history mutation unexpectedly succeeded: %s", query)
+		}
 	}
 }

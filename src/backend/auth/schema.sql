@@ -139,7 +139,7 @@ CREATE TABLE migration_approvals (
     PRIMARY KEY (job_id, group_id)
 );
 
--- M2: Tabel Migration History (Append-Only Immutable, HANYA mencatat eksekusi yang berhasil commit)
+-- M2: Tabel Migration History append-only untuk semua attempt eksekusi.
 CREATE TABLE migration_history (
     execution_id          BIGSERIAL PRIMARY KEY,
     database_id           BIGINT NOT NULL REFERENCES database_targets(id) ON DELETE CASCADE,
@@ -154,7 +154,8 @@ CREATE TABLE migration_history (
     executed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     duration_ms           INT NOT NULL DEFAULT 0,
     rows_affected         BIGINT NOT NULL DEFAULT 0,
-    status                TEXT NOT NULL DEFAULT 'success' CHECK (status = 'success'),
+    status                TEXT NOT NULL DEFAULT 'success'
+                          CHECK (status IN ('success', 'failed')),
     reverted_execution_id BIGINT REFERENCES migration_history(execution_id)
 );
 

@@ -50,9 +50,34 @@ type Execution struct {
 	Action              ExecutionAction
 	SQLExecuted         string
 	ExecutedBy          int64
+	ExecutedByName      string
 	ExecutedAt          time.Time
 	DurationMs          int
 	RowsAffected        int64
 	Status              Status
 	RevertedExecutionID *int64
+}
+
+func FilterHistory(executions []Execution, hideRollback bool) []Execution {
+	if !hideRollback {
+		return executions
+	}
+
+	hidden := make(map[int64]struct{})
+	for _, execution := range executions {
+		if execution.Action == ActionRollback &&
+			execution.Status == StatusSuccess &&
+			execution.RevertedExecutionID != nil {
+			hidden[execution.ExecutionID] = struct{}{}
+			hidden[*execution.RevertedExecutionID] = struct{}{}
+		}
+	}
+
+	filtered := make([]Execution, 0, len(executions))
+	for _, execution := range executions {
+		if _, ok := hidden[execution.ExecutionID]; !ok {
+			filtered = append(filtered, execution)
+		}
+	}
+	return filtered
 }

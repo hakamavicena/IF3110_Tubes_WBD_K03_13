@@ -368,6 +368,13 @@ func (*migrationCreateRepository) RecordExecution(
 	panic("unexpected RecordExecution")
 }
 
+func (*migrationCreateRepository) ListHistory(
+	context.Context,
+	int64,
+) ([]migration.Execution, error) {
+	panic("unexpected ListHistory")
+}
+
 func (*migrationCreateRepository) UpdateDraft(
 	context.Context,
 	int64,
@@ -818,4 +825,231 @@ func TestAPIMigrationActionsRejectInvalidRequests(t *testing.T) {
 			}
 		})
 	}
+}
+
+type migrationHistoryTestAuthorizer struct {
+	ports.DenyAll
+	canView bool
+}
+
+func (a migrationHistoryTestAuthorizer) CanView(
+	context.Context,
+	int64,
+	int64,
+) (bool, error) {
+	return a.canView, nil
+}
+
+type migrationHistoryTestRepository struct {
+	migration.Repository
+	executions    []migration.Execution
+	requestedDBID int64
+}
+
+func (r *migrationHistoryTestRepository) ListHistory(
+	_ context.Context,
+	databaseID int64,
+) ([]migration.Execution, error) {
+	r.requestedDBID = databaseID
+	return r.executions, nil
+}
+
+func newMigrationHistoryTestMux(
+	t *testing.T,
+	repo *migrationHistoryTestRepository,
+	authz ports.Authorizer,
+) *http.ServeMux {
+	t.Helper()
+
+	viewer := dbviewer.NewService(authz, nil)
+	migrations := migration.NewService(repo, authz, nil, nil, time.Second)
+	handler, err := NewHandler(viewer, migrations, authz, func(*http.Request) string {
+		return "csrf"
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	handler.Register(mux, func(next http.Handler) http.Handler {
+		return next
+	})
+	return mux
+}
+
+func TestAPIListMigrationHistoryAndHideRollback(t *testing.T) {
+	revertedID := int64(2)
+	repo := &migrationHistoryTestRepository{
+		executions: []migration.Execution{
+			{
+				ExecutionID: 1, DatabaseID: 10, MigrationID: 4,
+				Version: 1, Revision: 1, Title: "first",
+				Action: migration.ActionApply, SQLExecuted: "CREATE TABLE firsts(id int)",
+				ExecutedBy: 7, ExecutedByName: "alice",
+				Status: migration.StatusSuccess,
+			},
+			{
+				ExecutionID: 2, DatabaseID: 10, MigrationID: 5,
+				Version: 2, Revision: 1, Title: "second",
+				Action: migration.ActionApply, SQLExecuted: "CREATE TABLE seconds(id int)",
+				ExecutedBy: 7, ExecutedByName: "alice",
+				Status: migration.StatusSuccess,
+			},
+			{
+				ExecutionID: 3, DatabaseID: 10, MigrationID: 5,
+				Version: 2, Revision: 1, Title: "second",
+				Action: migration.ActionRollback, SQLExecuted: "DROP TABLE seconds",
+				ExecutedBy: 7, ExecutedByName: "alice",
+				Status: migration.StatusSuccess, RevertedExecutionID: &revertedID,
+			},
+			{
+				ExecutionID: 4, DatabaseID: 10, MigrationID: 5,
+				Version: 2, Revision: 1, Title: "second",
+				Action: migration.ActionForward, SQLExecuted: "CREATE TABLE seconds(id int)",
+				ExecutedBy: 7, ExecutedByName: "alice",
+				Status: migration.StatusSuccess, RevertedExecutionID: ptrHistoryInt64(3),
+			},
+			{
+				ExecutionID: 5, DatabaseID: 10, MigrationID: 6,
+				Version: 3, Revision: 1, Title: "third",
+				Action: migration.ActionApply, SQLExecuted: "invalid SQL",
+				ExecutedBy: 7, ExecutedByName: "alice",
+				Status: migration.StatusFailed,
+			},
+		},
+	}
+	mux := newMigrationHistoryTestMux(
+		t,
+		repo,
+		migrationHistoryTestAuthorizer{canView: true},
+	)
+
+	tests := []struct {
+		name    string
+		query   string
+		wantIDs []int64
+	}{
+		{name: "all executions", wantIDs: []int64{1, 2, 3, 4, 5}},
+		{name: "hide successful rollback pair", query: "?hide_rollback=true", wantIDs: []int64{1, 4, 5}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodGet,
+				"/api/databases/10/history"+test.query,
+				nil,
+			)
+			request = WithUserID(request, 42)
+			recorder := httptest.NewRecorder()
+
+			mux.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("GET migration history status = %d, want %d; body: %s",
+					recorder.Code, http.StatusOK, recorder.Body.String())
+			}
+			if got := recorder.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("Content-Type = %q, want application/json", got)
+			}
+			var response migrationHistoryResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode history response: %v", err)
+			}
+			if len(response.History) != len(test.wantIDs) {
+				t.Fatalf("history has %d rows, want %d: %+v",
+					len(response.History), len(test.wantIDs), response.History)
+			}
+			for i, wantID := range test.wantIDs {
+				if response.History[i].ExecutionID != wantID {
+					t.Errorf("history[%d].execution_id = %d, want %d",
+						i, response.History[i].ExecutionID, wantID)
+				}
+			}
+			if len(response.History) > 0 &&
+				(response.History[0].SQLExecuted == "" ||
+					response.History[0].ExecutedByName != "alice") {
+				t.Errorf("history is missing SQL snapshot or actor: %+v", response.History[0])
+			}
+		})
+	}
+	if repo.requestedDBID != 10 {
+		t.Errorf("repository database ID = %d, want 10", repo.requestedDBID)
+	}
+}
+
+func TestAPIListMigrationHistoryRejectsInvalidRequests(t *testing.T) {
+	tests := []struct {
+		name       string
+		path       string
+		withUser   bool
+		canView    bool
+		wantStatus int
+	}{
+		{
+			name:       "missing user",
+			path:       "/api/databases/10/history",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "invalid database ID",
+			path:       "/api/databases/not-an-id/history",
+			withUser:   true,
+			canView:    true,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "invalid hide rollback value",
+			path:       "/api/databases/10/history?hide_rollback=maybe",
+			withUser:   true,
+			canView:    true,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "duplicate hide rollback values",
+			path:       "/api/databases/10/history?hide_rollback=true&hide_rollback=false",
+			withUser:   true,
+			canView:    true,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "user lacks view access",
+			path:       "/api/databases/10/history",
+			withUser:   true,
+			wantStatus: http.StatusForbidden,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repo := &migrationHistoryTestRepository{}
+			mux := newMigrationHistoryTestMux(
+				t,
+				repo,
+				migrationHistoryTestAuthorizer{canView: test.canView},
+			)
+			request := httptest.NewRequest(http.MethodGet, test.path, nil)
+			if test.withUser {
+				request = WithUserID(request, 42)
+			}
+			recorder := httptest.NewRecorder()
+
+			mux.ServeHTTP(recorder, request)
+
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("GET %s status = %d, want %d; body: %s",
+					test.path, recorder.Code, test.wantStatus, recorder.Body.String())
+			}
+			var response apiErrorResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if response.Error == "" {
+				t.Fatal("expected a JSON error message")
+			}
+		})
+	}
+}
+
+func ptrHistoryInt64(value int64) *int64 {
+	return &value
 }
