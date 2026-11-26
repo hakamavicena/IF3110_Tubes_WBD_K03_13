@@ -3,6 +3,7 @@ package httpdb
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -70,6 +71,11 @@ func (h *Handler) Register(mux *http.ServeMux, protect func(http.Handler) http.H
 		mux.Handle(pattern, protect(handler))
 	}
 	route("GET /databases", h.listDatabases)
+	route("GET /api/databases", h.apiListDatabases)
+	route("GET /api/databases/{dbID}/schemas", h.apiListSchemas)
+	route("GET /api/databases/{dbID}/schemas/{schema}/tables", h.apiListTables)
+	route("GET /api/databases/{dbID}/schemas/{schema}/tables/{table}", h.apiTableDetail)
+	route("GET /api/databases/{dbID}/schemas/{schema}/tables/{table}/data", h.apiTableData)
 	route("GET /databases/{dbID}", h.listSchemas)
 	route("GET /databases/{dbID}/schemas/{schema}/tables", h.listTables)
 	route("GET /databases/{dbID}/schemas/{schema}/tables/{table}", h.tableDetail)
@@ -134,6 +140,27 @@ func (h *Handler) handleError(w http.ResponseWriter, r *http.Request, err error)
 	h.render(w, "error.html", map[string]any{"Code": code, "Message": message})
 }
 
+func (h *Handler) handleAPIError(w http.ResponseWriter, r *http.Request, err error) {
+	code, message := http.StatusInternalServerError, "internal server error"
+
+	switch {
+	case errors.Is(err, apperr.ErrForbidden):
+		code, message = http.StatusForbidden, "Anda tidak memiliki akses ke database ini."
+	case errors.Is(err, apperr.ErrNotFound):
+		code, message = http.StatusNotFound, "Data tidak ditemukan."
+	case errors.Is(err, apperr.ErrInvalidInput):
+		code, message = http.StatusBadRequest, userMessage(err)
+	case errors.Is(err, apperr.ErrNotExecutable):
+		code, message = http.StatusConflict, userMessage(err)
+	case errors.Is(err, apperr.ErrConnectionFailed):
+		code, message = http.StatusBadGateway, "Tidak dapat terhubung ke database target."
+	default:
+		slog.Error("unhandled database API error", "path", r.URL.Path, "err", err)
+	}
+
+	writeJSON(w, code, apiErrorResponse{Error: message})
+}
+
 func (h *Handler) parseID(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
 	id, err := pathID(r, name)
 	if err != nil {
@@ -154,6 +181,303 @@ func (h *Handler) listDatabases(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.render(w, "databases.html", map[string]any{"Databases": databases})
+}
+
+type apiErrorResponse struct {
+	Error string `json:"error"`
+}
+
+type databaseAccessDTO struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Access string `json:"access"`
+}
+
+type databaseListResponse struct {
+	Databases []databaseAccessDTO `json:"databases"`
+}
+
+type schemaListResponse struct {
+	Schemas []string `json:"schemas"`
+}
+
+type tableInfoDTO struct {
+	Schema string `json:"schema"`
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+}
+
+type tableListResponse struct {
+	Tables []tableInfoDTO `json:"tables"`
+}
+
+type columnInfoDTO struct {
+	Position int     `json:"position"`
+	Name     string  `json:"name"`
+	DataType string  `json:"data_type"`
+	Nullable bool    `json:"nullable"`
+	Default  *string `json:"default"`
+}
+
+type constraintInfoDTO struct {
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Definition string `json:"definition"`
+}
+
+type indexInfoDTO struct {
+	Name       string `json:"name"`
+	Definition string `json:"definition"`
+	Unique     bool   `json:"unique"`
+}
+
+type tableDetailResponse struct {
+	Table       tableInfoDTO        `json:"table"`
+	Columns     []columnInfoDTO     `json:"columns"`
+	Constraints []constraintInfoDTO `json:"constraints"`
+	Indexes     []indexInfoDTO      `json:"indexes"`
+}
+
+type tableDataResponse struct {
+	Columns  []string    `json:"columns"`
+	Rows     [][]*string `json:"rows"`
+	Page     int         `json:"page"`
+	PageSize int         `json:"page_size"`
+	Total    int64       `json:"total"`
+	Pages    int         `json:"pages"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		slog.Error("encode JSON response failed", "err", err)
+	}
+}
+
+func (h *Handler) apiListDatabases(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	databases, err := h.authz.AccessibleDatabases(r.Context(), userID)
+	if err != nil {
+		slog.Error("list accessible databases failed", "user_id", userID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, apiErrorResponse{Error: "internal server error"})
+		return
+	}
+
+	items := make([]databaseAccessDTO, 0, len(databases))
+	for _, database := range databases {
+		var access string
+		switch database.Level {
+		case ports.LevelView:
+			access = "view"
+		case ports.LevelEdit:
+			access = "edit"
+		default:
+			slog.Error(
+				"unexpected database access level",
+				"database_id", database.DatabaseID,
+				"level", database.Level,
+			)
+			writeJSON(w, http.StatusInternalServerError, apiErrorResponse{Error: "internal server error"})
+			return
+		}
+
+		items = append(items, databaseAccessDTO{
+			ID:     database.DatabaseID,
+			Name:   database.Name,
+			Access: access,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, databaseListResponse{Databases: items})
+}
+
+func (h *Handler) apiListSchemas(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	schemas, err := h.viewer.ListSchemas(r.Context(), userID, dbID)
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+	if schemas == nil {
+		schemas = []string{}
+	}
+
+	writeJSON(w, http.StatusOK, schemaListResponse{Schemas: schemas})
+}
+
+func (h *Handler) apiListTables(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	schema := r.PathValue("schema")
+	tables, err := h.viewer.ListTables(r.Context(), userID, dbID, schema)
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	items := make([]tableInfoDTO, 0, len(tables))
+	for _, table := range tables {
+		items = append(items, tableInfoDTO{
+			Schema: table.Schema,
+			Name:   table.Name,
+			Type:   table.Type,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, tableListResponse{Tables: items})
+}
+
+func (h *Handler) apiTableDetail(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	detail, err := h.viewer.GetTableDetail(
+		r.Context(),
+		userID,
+		dbID,
+		r.PathValue("schema"),
+		r.PathValue("table"),
+	)
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	response := tableDetailResponse{
+		Table: tableInfoDTO{
+			Schema: detail.Table.Schema,
+			Name:   detail.Table.Name,
+			Type:   detail.Table.Type,
+		},
+		Columns:     make([]columnInfoDTO, 0, len(detail.Columns)),
+		Constraints: make([]constraintInfoDTO, 0, len(detail.Constraints)),
+		Indexes:     make([]indexInfoDTO, 0, len(detail.Indexes)),
+	}
+
+	for _, column := range detail.Columns {
+		response.Columns = append(response.Columns, columnInfoDTO{
+			Position: column.Position,
+			Name:     column.Name,
+			DataType: column.DataType,
+			Nullable: column.Nullable,
+			Default:  column.Default,
+		})
+	}
+	for _, constraint := range detail.Constraints {
+		response.Constraints = append(response.Constraints, constraintInfoDTO{
+			Name:       constraint.Name,
+			Type:       constraint.Type,
+			Definition: constraint.Definition,
+		})
+	}
+	for _, index := range detail.Indexes {
+		response.Indexes = append(response.Indexes, indexInfoDTO{
+			Name:       index.Name,
+			Definition: index.Definition,
+			Unique:     index.Unique,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) apiTableData(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	page := 1
+	if value := r.URL.Query().Get("page"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			h.handleAPIError(w, r, fmt.Errorf("%w: halaman tidak valid", apperr.ErrInvalidInput))
+			return
+		}
+		page = parsed
+	}
+
+	size := 0
+	if value := r.URL.Query().Get("size"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			h.handleAPIError(w, r, fmt.Errorf("%w: ukuran halaman tidak valid", apperr.ErrInvalidInput))
+			return
+		}
+		size = parsed
+	}
+
+	data, err := h.viewer.GetTableData(
+		r.Context(),
+		userID,
+		dbID,
+		r.PathValue("schema"),
+		r.PathValue("table"),
+		page,
+		size,
+	)
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	rows := data.Rows
+	if rows == nil {
+		rows = [][]*string{}
+	}
+
+	writeJSON(w, http.StatusOK, tableDataResponse{
+		Columns:  data.Columns,
+		Rows:     rows,
+		Page:     data.Page,
+		PageSize: data.PageSize,
+		Total:    data.Total,
+		Pages:    data.Pages,
+	})
 }
 
 func (h *Handler) listSchemas(w http.ResponseWriter, r *http.Request) {
