@@ -3,10 +3,9 @@ package accesscontrol
 import (
 	"context"
 	"encoding/json"
-	"html/template"
-	"log"
+	"errors"
+	"log/slog"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,532 +13,604 @@ import (
 
 	"backend/auth"
 	"backend/dbengine/pkg/dbtarget"
+	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
 
 var usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_.-]{3,50}$`)
+
+const maxAdminBody = 1 << 20
 
 type AdminHandler struct {
 	service            *AccessService
 	repo               AccessRepository
 	manager            *dbtarget.Manager
 	box                *dbtarget.SecretBox
-	templatePath       string
-	template           *template.Template
 	sessionInvalidator func(userID int) error
+	sessionRotator     func(w http.ResponseWriter, r *http.Request) (string, error)
 }
 
 func NewAdminHandler(service *AccessService, repo AccessRepository, manager *dbtarget.Manager, box *dbtarget.SecretBox) *AdminHandler {
 	return &AdminHandler{
 		service: service,
-		repo:    repo,
+		repo: repo,
 		manager: manager,
-		box:     box,
+		box: box,
 	}
-}
-
-func (h *AdminHandler) SetTemplatePath(path string) {
-	h.templatePath = path
-}
-
-func (h *AdminHandler) SetTemplate(tmpl *template.Template) {
-	h.template = tmpl
 }
 
 func (h *AdminHandler) SetSessionInvalidator(f func(userID int) error) {
 	h.sessionInvalidator = f
 }
 
-type AdminPageData struct {
-	Users     []UserWithGroups
-	Groups    []GroupDetail
-	Databases []Database
-	CSRFToken string
-	Message   string
-	Error     string
+func (h *AdminHandler) SetSessionRotator(f func(w http.ResponseWriter, r *http.Request) (string, error)) {
+	h.sessionRotator = f
 }
 
-// Menampilkan dashboard admin
-func (h *AdminHandler) AdminDashboard(w http.ResponseWriter, r *http.Request) {
-	// memastikan request menggunakan get
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func (h *AdminHandler) Register(mux *http.ServeMux, protect func(http.HandlerFunc) http.Handler) {
+	mux.Handle("GET /api/admin/users", protect(h.ListUsers))
+	mux.Handle("POST /api/admin/users", protect(h.CreateUser))
+	mux.Handle("PATCH /api/admin/users/{id}/status", protect(h.SetUserStatus))
+	mux.Handle("GET /api/admin/groups", protect(h.ListGroups))
+	mux.Handle("POST /api/admin/groups", protect(h.CreateGroup))
+	mux.Handle("PUT /api/admin/groups/{id}/leader", protect(h.SetGroupLeader))
+	mux.Handle("POST /api/admin/groups/{id}/members", protect(h.AddGroupMember))
+	mux.Handle("DELETE /api/admin/groups/{id}/members/{userID}", protect(h.RemoveGroupMember))
+	mux.Handle("PUT /api/admin/groups/{id}/access", protect(h.SetGroupAccess))
+	mux.Handle("GET /api/admin/targets", protect(h.ListTargets))
+	mux.Handle("POST /api/admin/targets", protect(h.CreateTarget))
+	mux.Handle("DELETE /api/admin/targets/{id}", protect(h.DeleteTarget))
+}
 
-	// 1. Ambil data users beserta grupnya
-	rawUsers, err := h.repo.GetAllUsers()
-	if err != nil {
-		log.Printf("Gagal mengambil daftar pengguna: %v", err)
-		http.Error(w, "Gagal memuat data pengguna", http.StatusInternalServerError)
-		return
+func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAdminBody)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		auth.WriteError(w, http.StatusBadRequest, "body request tidak valid")
+		return false
 	}
-	//Membentuk data semua group yang diikuti masing-masing user
-	var usersWithGroups []UserWithGroups
-	for _, u := range rawUsers {
-		grps, _ := h.repo.GetGroupsByUserID(u.ID)
-		usersWithGroups = append(usersWithGroups, UserWithGroups{
-			User:   u,
-			Groups: grps,
-		})
-	}
+	return true
+}
 
-	// 2. Ambil data grup beserta anggota dan grant database
-	rawGroups, err := h.repo.GetAllGroups()
-	if err != nil {
-		log.Printf("Gagal mengambil daftar grup: %v", err)
-		http.Error(w, "Gagal memuat data grup", http.StatusInternalServerError)
-		return
-	}
-	// melihat detail grup lalu mengambil member dan grant nya
-	var groupDetails []GroupDetail
-	for _, g := range rawGroups {
-		members, _ := h.repo.GetGroupMembers(g.ID)
-		grants, _ := h.repo.GetGroupGrants(g.ID)
-		groupDetails = append(groupDetails, GroupDetail{
-			Group:   g,
-			Members: members,
-			Grants:  grants,
-		})
-	}
+func pathID(r *http.Request, name string) (int, bool) {
+	v, err := strconv.Atoi(r.PathValue(name))
+	return v, err == nil && v > 0
+}
 
-	// 3. Ambil data koneksi database (tanpa password)
-	dbs, err := h.repo.GetAllDatabases()
-	if err != nil {
-		log.Printf("Gagal mengambil daftar database: %v", err)
-		http.Error(w, "Gagal memuat data database", http.StatusInternalServerError)
-		return
-	}
+func actorID(r *http.Request) int {
+	id, _ := auth.UserIDFromContext(r.Context())
+	return int(id)
+}
 
-	csrfToken := auth.CSRFToken(r)
-	msg := r.URL.Query().Get("msg")
-	errMsg := r.URL.Query().Get("err")
+func audit(r *http.Request, event string, attrs ...any) {
+	base := []any{"event", event, "status", "success", "actor_id", actorID(r)}
+	slog.InfoContext(r.Context(), "aktivitas admin", append(base, attrs...)...)
+}
 
-	data := AdminPageData{
-		Users:     usersWithGroups,
-		Groups:    groupDetails,
-		Databases: dbs,
-		CSRFToken: csrfToken,
-		Message:   msg,
-		Error:     errMsg,
-	}
+func serverError(w http.ResponseWriter, r *http.Request, msg string, err error) {
+	slog.ErrorContext(r.Context(), msg, "event", "admin.error", "status", "error", "path", r.URL.Path, "err", err)
+	auth.WriteError(w, http.StatusInternalServerError, "terjadi kesalahan pada server")
+}
 
-	tmpl := h.template
-	if tmpl == nil {
-		path := h.templatePath
-		if path == "" {
-			path = "frontend/templates/admin.html"
-		}
-		t, err := template.ParseFiles(path)
+func (h *AdminHandler) privilegeChanged(w http.ResponseWriter, r *http.Request, targetUserID int) (newCSRF string) {
+	if targetUserID == actorID(r) && h.sessionRotator != nil {
+		token, err := h.sessionRotator(w, r)
 		if err != nil {
-			log.Printf("Gagal parse template admin (%s): %v", path, err)
-			http.Error(w, "Gagal merender template admin", http.StatusInternalServerError)
+			slog.WarnContext(r.Context(), "gagal merotasi sesi", "event", "auth.rotate_session", "status", "failed", "err", err)
+			return ""
+		}
+		return token
+	}
+	if h.sessionInvalidator != nil {
+		if err := h.sessionInvalidator(targetUserID); err != nil {
+			slog.WarnContext(r.Context(), "gagal mencabut sesi", "event", "auth.revoke_sessions", "status", "failed", "target_user_id", targetUserID, "err", err)
+		}
+	}
+	return ""
+}
+
+func withCSRF(m map[string]any, token string) map[string]any {
+	if token != "" {
+		m["csrf_token"] = token
+	}
+	return m
+}
+
+func isUniqueViolation(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "23505"
+}
+
+type userJSON struct {
+	ID       int     `json:"id"`
+	Username string  `json:"username"`
+	IsAdmin  bool    `json:"is_admin"`
+	IsActive bool    `json:"is_active"`
+	Groups   []Group `json:"groups"`
+}
+
+func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
+	users, err := h.repo.GetAllUsers()
+	if err != nil {
+		serverError(w, r, "gagal mengambil daftar pengguna", err)
+		return
+	}
+	out := make([]userJSON, 0, len(users))
+	for _, u := range users {
+		groups, err := h.repo.GetGroupsByUserID(u.ID)
+		if err != nil {
+			serverError(w, r, "gagal mengambil group pengguna", err)
 			return
 		}
-		tmpl = t
+		if groups == nil {
+			groups = []Group{}
+		}
+		out = append(out, userJSON{ID: u.ID, Username: u.Username, IsAdmin: u.IsAdmin, IsActive: u.IsActive, Groups: groups})
 	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := tmpl.Execute(w, data); err != nil {
-		log.Printf("Gagal eksekusi template admin: %v", err)
-		http.Error(w, "Gagal merender halaman admin", http.StatusInternalServerError)
-	}
+	auth.WriteJSON(w, http.StatusOK, out)
 }
 
-
-// Diatas itu keseluruhan alur admindashboard ngambil data terus diberikan ke page
-
 func (h *AdminHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
-	// Mastiin menggunakan post untuk ngubah data
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		IsAdmin  bool   `json:"is_admin"`
+	}
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	req.Username = strings.TrimSpace(req.Username)
+	if !usernameRegex.MatchString(req.Username) {
+		auth.WriteError(w, http.StatusBadRequest, "username harus 3-50 karakter alfanumerik atau _ . -")
 		return
 	}
 
-	//ngambil input dari form
-	username := strings.TrimSpace(r.FormValue("username"))
-	password := r.FormValue("password")
-	isAdminVal := r.FormValue("is_admin")
-	isAdmin := isAdminVal == "true" || isAdminVal == "1" || isAdminVal == "on"
-
-	if !usernameRegex.MatchString(username) {
-		h.redirectWith(w, r, "", "Username harus 3-50 karakter alfanumerik atau _ . -", http.StatusBadRequest)
+	if len(req.Password) < 8 {
+		auth.WriteError(w, http.StatusBadRequest, "password minimal 8 karakter")
 		return
 	}
 
-	if len(password) < 8 {
-		h.redirectWith(w, r, "", "Password minimal harus 8 karakter", http.StatusBadRequest)
-		return
-	}
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
-		h.redirectWith(w, r, "", "Gagal memproses password", http.StatusInternalServerError)
+		serverError(w, r, "gagal hash password", err)
 		return
 	}
-
-	_, err = h.repo.CreateUserWithPassword(username, string(hash), isAdmin)
+	u, err = h.repo.CreateUserWithPassword(req.Username, string(hash), req.IsAdmin)
 	if err != nil {
-		log.Printf("Gagal membuat user %s: %v", username, err)
-		h.redirectWith(w, r, "", "Gagal membuat user (username mungkin sudah digunakan)", http.StatusBadRequest)
+		if isUniqueViolation(err) {
+			auth.WriteError(w, http.StatusConflict, "username sudah digunakan")
+			return
+		}
+		serverError(w, r, "gagal membuat user", err)
 		return
 	}
-
-	h.redirectWith(w, r, "User '"+username+"' berhasil dibuat", "", http.StatusOK)
+	audit(r, "admin.user.create", "target_user_id", u.ID, "is_admin", u.IsAdmin)
+	auth.WriteJSON(w, http.StatusCreated, userJSON{ID: u.ID, Username: u.Username, IsAdmin: u.IsAdmin, IsActive: u.IsActive, Groups: []Group{}})
 }
 
 func (h *AdminHandler) SetUserStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	targetID, ok := pathID(r, "id")
+	if !ok {
+		auth.WriteError(w, http.StatusBadRequest, "ID user tidak valid")
 		return
 	}
-
-	//ngambil id user
-	userIDStr := r.FormValue("user_id")
-	targetID, err := strconv.Atoi(userIDStr)
-	if err != nil || targetID <= 0 {
-		h.redirectWith(w, r, "", "ID user tidak valid", http.StatusBadRequest)
+	var req struct {
+		IsActive *bool `json:"is_active"`
+		IsAdmin  *bool `json:"is_admin"`
+	}
+	if !decodeBody(w, r, &req) {
 		return
 	}
-
-	action := strings.TrimSpace(r.FormValue("action"))
-
-	// Ambil ID admin yang sedang login
-	currentUserID, _ := auth.UserIDFromContext(r.Context())
-
-	if action == "deactivate" {
-		// Proteksi: tidak boleh menonaktifkan diri sendiri
-		if int64(targetID) == currentUserID {
-			h.redirectWith(w, r, "", "Admin tidak boleh menonaktifkan dirinya sendiri", http.StatusBadRequest)
+	if req.IsActive == nil && req.IsAdmin == nil {
+		auth.WriteError(w, http.StatusBadRequest, "isi is_active dan/atau is_admin")
+		return
+	}
+	target, err := h.repo.GetUser(targetID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			auth.WriteError(w, http.StatusNotFound, "user tidak ditemukan")
 			return
 		}
+		serverError(w, r, "gagal mengambil user", err)
+		return
+	}
+	current := actorID(r)
 
-		// Proteksi: tidak boleh menonaktifkan admin terakhir
-		targetUser, err := h.repo.GetUser(targetID)
+	losesAdmin := target.IsAdmin && target.IsActive &&
+		((req.IsActive != nil && !*req.IsActive) || (req.IsAdmin != nil && !*req.IsAdmin))
+	if req.IsActive != nil && !*req.IsActive && targetID == current {
+		auth.WriteError(w, http.StatusBadRequest, "admin tidak boleh menonaktifkan dirinya sendiri")
+		return
+	}
+	if losesAdmin {
+		count, err := h.repo.GetActiveAdminCount()
 		if err != nil {
-			h.redirectWith(w, r, "", "User tidak ditemukan", http.StatusNotFound)
+			serverError(w, r, "gagal memverifikasi jumlah admin", err)
 			return
 		}
-
-		if targetUser.IsAdmin {
-			activeAdmins, err := h.repo.GetActiveAdminCount()
-			if err != nil {
-				h.redirectWith(w, r, "", "Gagal memverifikasi jumlah admin", http.StatusInternalServerError)
-				return
-			}
-			if activeAdmins <= 1 {
-				h.redirectWith(w, r, "", "Tidak dapat menonaktifkan admin terakhir", http.StatusBadRequest)
-				return
-			}
-		}
-
-		if err := h.repo.SetUserActive(targetID, false); err != nil {
-			log.Printf("Gagal menonaktifkan user %d: %v", targetID, err)
-			h.redirectWith(w, r, "", "Gagal menonaktifkan user", http.StatusInternalServerError)
+		if count <= 1 {
+			auth.WriteError(w, http.StatusConflict, "tidak dapat menghapus/menonaktifkan admin terakhir")
 			return
 		}
-
-		// Cabut seluruh sesi user yang dinonaktifkan secara instan
-		if h.sessionInvalidator != nil {
-			if err := h.sessionInvalidator(targetID); err != nil {
-				log.Printf("Peringatan: gagal membatalkan sesi user %d: %v", targetID, err)
-			}
-		}
-
-		h.redirectWith(w, r, "User berhasil dinonaktifkan", "", http.StatusOK)
-		return
-	} else if action == "activate" {
-		if err := h.repo.SetUserActive(targetID, true); err != nil {
-			log.Printf("Gagal mengaktifkan user %d: %v", targetID, err)
-			h.redirectWith(w, r, "", "Gagal mengaktifkan user", http.StatusInternalServerError)
-			return
-		}
-		h.redirectWith(w, r, "User berhasil diaktifkan", "", http.StatusOK)
-		return
 	}
 
-	h.redirectWith(w, r, "", "Aksi tidak dikenali", http.StatusBadRequest)
+	csrf := ""
+	if req.IsAdmin != nil && *req.IsAdmin != target.IsAdmin {
+		if err := h.repo.SetUserAdmin(targetID, *req.IsAdmin); err != nil {
+			serverError(w, r, "gagal mengubah status admin", err)
+			return
+		}
+		csrf = h.privilegeChanged(w, r, targetID) // privilege berubah -> rotasi / cabut sesi
+		audit(r, "admin.user.set_admin", "target_user_id", targetID, "is_admin", *req.IsAdmin)
+	}
+	if req.IsActive != nil && *req.IsActive != target.IsActive {
+		if err := h.repo.SetUserActive(targetID, *req.IsActive); err != nil {
+			serverError(w, r, "gagal mengubah status aktif", err)
+			return
+		}
+		if !*req.IsActive && h.sessionInvalidator != nil {
+			if err := h.sessionInvalidator(targetID); err != nil {
+				slog.WarnContext(r.Context(), "gagal mencabut sesi", "event", "auth.revoke_sessions", "status", "failed", "target_user_id", targetID, "err", err)
+			}
+		}
+		audit(r, "admin.user.set_active", "target_user_id", targetID, "is_active", *req.IsActive)
+	}
+	updated, err := h.repo.GetUser(targetID)
+	if err != nil {
+		serverError(w, r, "gagal membaca user", err)
+		return
+	}
+	auth.WriteJSON(w, http.StatusOK, withCSRF(map[string]any{"user": updated}, csrf))
+}
+
+type groupJSON struct {
+	ID             int                  `json:"id"`
+	Name           string               `json:"name"`
+	LeaderID       *int                 `json:"leader_id"`
+	LeaderUsername string               `json:"leader_username"`
+	Members        []User               `json:"members"`
+	Grants         []GroupDatabaseGrant `json:"grants"`
+}
+
+func (h *AdminHandler) ListGroups(w http.ResponseWriter, r *http.Request) {
+	groups, err := h.repo.GetAllGroups()
+	if err != nil {
+		serverError(w, r, "gagal mengambil daftar group", err)
+		return
+	}
+	out := make([]groupJSON, 0, len(groups))
+	for _, g := range groups {
+		members, err := h.repo.GetGroupMembers(g.ID)
+		if err != nil {
+			serverError(w, r, "gagal mengambil anggota group", err)
+			return
+		}
+		grants, err := h.repo.GetGroupGrants(g.ID)
+		if err != nil {
+			serverError(w, r, "gagal mengambil grant group", err)
+			return
+		}
+		if members == nil {
+			members = []User{}
+		}
+		if grants == nil {
+			grants = []GroupDatabaseGrant{}
+		}
+		out = append(out, groupJSON{ID: g.ID, Name: g.Name, LeaderID: g.LeaderID, LeaderUsername: g.LeaderUsername, Members: members, Grants: grants})
+	}
+	auth.WriteJSON(w, http.StatusOK, out)
 }
 
 func (h *AdminHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	var req struct {
+		Name string `json:"name"`
+	}
+	if !decodeBody(w, r, &req) {
 		return
 	}
-
-	name := strings.TrimSpace(r.FormValue("name"))
-	if name == "" {
-		h.redirectWith(w, r, "", "Nama grup tidak boleh kosong", http.StatusBadRequest)
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || len(req.Name) > 100 {
+		auth.WriteError(w, http.StatusBadRequest, "nama group wajib diisi (maks. 100 karakter)")
 		return
 	}
-
-	_, err := h.repo.CreateGroup(name)
+	g, err := h.repo.CreateGroup(req.Name)
 	if err != nil {
-		log.Printf("Gagal membuat grup %s: %v", name, err)
-		h.redirectWith(w, r, "", "Gagal membuat grup (nama mungkin sudah ada)", http.StatusBadRequest)
+		if isUniqueViolation(err) {
+			auth.WriteError(w, http.StatusConflict, "nama group sudah digunakan")
+			return
+		}
+		serverError(w, r, "gagal membuat group", err)
 		return
 	}
-
-	h.redirectWith(w, r, "Grup '"+name+"' berhasil dibuat", "", http.StatusOK)
+	audit(r, "admin.group.create", "group_id", g.ID)
+	auth.WriteJSON(w, http.StatusCreated, groupJSON{ID: g.ID, Name: g.Name, Members: []User{}, Grants: []GroupDatabaseGrant{}})
 }
 
-func (h *AdminHandler) AddUserToGroup(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+func (h *AdminHandler) SetGroupLeader(w http.ResponseWriter, r *http.Request) {
+	groupID, ok := pathID(r, "id")
+	if !ok {
+		auth.WriteError(w, http.StatusBadRequest, "ID group tidak valid")
+		return
+	}
+	var req struct {
+		UserID int `json:"user_id"`
+	}
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.UserID <= 0 {
+		auth.WriteError(w, http.StatusBadRequest, "user_id tidak valid")
+		return
+	}
+	group, err := h.repo.GetGroup(groupID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			auth.WriteError(w, http.StatusNotFound, "group tidak ditemukan")
+			return
+		}
+		serverError(w, r, "gagal mengambil group", err)
+		return
+	}
+	user, err := h.repo.GetUser(req.UserID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			auth.WriteError(w, http.StatusBadRequest, "user tidak ditemukan")
+			return
+		}
+		serverError(w, r, "gagal mengambil user", err)
+		return
+	}
+	if !user.IsActive {
+		auth.WriteError(w, http.StatusBadRequest, "leader harus berupa user aktif")
+		return
+	}
+	member, err := h.repo.IsGroupMember(req.UserID, groupID)
+	if err != nil {
+		serverError(w, r, "gagal memeriksa keanggotaan", err)
+		return
+	}
+	if !member {
+		auth.WriteError(w, http.StatusBadRequest, "leader harus anggota group tersebut")
+		return
+	}
+	oldLeader := group.LeaderID
+	if err := h.repo.SetGroupLeader(groupID, req.UserID); err != nil {
+		serverError(w, r, "gagal menetapkan leader", err)
 		return
 	}
 
-	userID, _ := strconv.Atoi(r.FormValue("user_id"))
-	groupID, _ := strconv.Atoi(r.FormValue("group_id"))
-
-	if userID <= 0 || groupID <= 0 {
-		h.redirectWith(w, r, "", "User ID dan Group ID harus valid", http.StatusBadRequest)
-		return
+	csrf := h.privilegeChanged(w, r, req.UserID)
+	if oldLeader != nil && *oldLeader != req.UserID {
+		if c := h.privilegeChanged(w, r, *oldLeader); c != "" {
+			csrf = c
+		}
 	}
-
-	if err := h.repo.AddUserToGroup(userID, groupID); err != nil {
-		h.redirectWith(w, r, "", "Gagal menambahkan user ke grup", http.StatusInternalServerError)
-		return
-	}
-
-	h.redirectWith(w, r, "Berhasil menambahkan user ke grup", "", http.StatusOK)
+	audit(r, "admin.group.set_leader", "group_id", groupID, "leader_id", req.UserID)
+	auth.WriteJSON(w, http.StatusOK, withCSRF(map[string]any{
+		"group_id": groupID, "leader_id": req.UserID, "leader_username": user.Username,
+	}, csrf))
 }
 
-func (h *AdminHandler) RemoveUserFromGroup(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+func (h *AdminHandler) AddGroupMember(w http.ResponseWriter, r *http.Request) {
+	groupID, ok := pathID(r, "id")
+	if !ok {
+		auth.WriteError(w, http.StatusBadRequest, "ID group tidak valid")
 		return
 	}
-
-	userID, _ := strconv.Atoi(r.FormValue("user_id"))
-	groupID, _ := strconv.Atoi(r.FormValue("group_id"))
-
-	if userID <= 0 || groupID <= 0 {
-		h.redirectWith(w, r, "", "User ID dan Group ID harus valid", http.StatusBadRequest)
+	var req struct {
+		UserID int `json:"user_id"`
+	}
+	if !decodeBody(w, r, &req) {
 		return
 	}
+	if req.UserID <= 0 {
+		auth.WriteError(w, http.StatusBadRequest, "user_id tidak valid")
+		return
+	}
+	if _, err := h.repo.GetGroup(groupID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			auth.WriteError(w, http.StatusNotFound, "group tidak ditemukan")
+			return
+		}
+		serverError(w, r, "gagal mengambil group", err)
+		return
+	}
+	if _, err := h.repo.GetUser(req.UserID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			auth.WriteError(w, http.StatusBadRequest, "user tidak ditemukan")
+			return
+		}
+		serverError(w, r, "gagal mengambil user", err)
+		return
+	}
+	if err := h.repo.AddUserToGroup(req.UserID, groupID); err != nil {
+		serverError(w, r, "gagal menambahkan user ke group", err)
+		return
+	}
+	csrf := h.privilegeChanged(w, r, req.UserID)
+	audit(r, "admin.group.add_member", "group_id", groupID, "target_user_id", req.UserID)
+	auth.WriteJSON(w, http.StatusOK, withCSRF(map[string]any{"group_id": groupID, "user_id": req.UserID}, csrf))
+}
 
+func (h *AdminHandler) RemoveGroupMember(w http.ResponseWriter, r *http.Request) {
+	groupID, ok1 := pathID(r, "id")
+	userID, ok2 := pathID(r, "userID")
+	if !ok1 || !ok2 {
+		auth.WriteError(w, http.StatusBadRequest, "ID group/user tidak valid")
+		return
+	}
+	group, err := h.repo.GetGroup(groupID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			auth.WriteError(w, http.StatusNotFound, "group tidak ditemukan")
+			return
+		}
+		serverError(w, r, "gagal mengambil group", err)
+		return
+	}
+	if group.LeaderID != nil && *group.LeaderID == userID {
+		auth.WriteError(w, http.StatusConflict, "user adalah leader group; tetapkan leader lain terlebih dahulu")
+		return
+	}
 	if err := h.repo.RemoveUserFromGroup(userID, groupID); err != nil {
-		h.redirectWith(w, r, "", "Gagal mengeluarkan user dari grup", http.StatusInternalServerError)
+		serverError(w, r, "gagal mengeluarkan user dari group", err)
 		return
 	}
-
-	h.redirectWith(w, r, "Berhasil mengeluarkan user dari grup", "", http.StatusOK)
+	csrf := h.privilegeChanged(w, r, userID)
+	audit(r, "admin.group.remove_member", "group_id", groupID, "target_user_id", userID)
+	auth.WriteJSON(w, http.StatusOK, withCSRF(map[string]any{"group_id": groupID, "user_id": userID}, csrf))
 }
 
 func (h *AdminHandler) SetGroupAccess(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	groupID, ok := pathID(r, "id")
+	if !ok {
+		auth.WriteError(w, http.StatusBadRequest, "ID group tidak valid")
 		return
 	}
-
-	groupID, _ := strconv.Atoi(r.FormValue("group_id"))
-	dbIDStr := r.FormValue("database_id")
-	if dbIDStr == "" {
-		dbIDStr = r.FormValue("db_id")
+	var req struct {
+		DatabaseID  int `json:"database_id"`
+		AccessLevel int `json:"access_level"`
 	}
-	dbID, _ := strconv.Atoi(dbIDStr)
-	level, _ := strconv.Atoi(r.FormValue("access_level"))
-
-	if groupID <= 0 || dbID <= 0 {
-		h.redirectWith(w, r, "", "Grup dan Database harus dipilih", http.StatusBadRequest)
+	if !decodeBody(w, r, &req) {
 		return
 	}
-
-	if level == 0 {
-		if err := h.repo.DeleteGroupAccess(groupID, dbID); err != nil {
-			log.Printf("Gagal cabut akses (group %d, db %d): %v", groupID, dbID, err)
-			h.redirectWith(w, r, "", "Gagal mencabut akses grup", http.StatusInternalServerError)
+	if req.DatabaseID <= 0 || req.AccessLevel < 0 || req.AccessLevel > 2 {
+		auth.WriteError(w, http.StatusBadRequest, "database_id wajib dan access_level harus 0 (cabut), 1 (view), atau 2 (view+edit)")
+		return
+	}
+	if _, err := h.repo.GetGroup(groupID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			auth.WriteError(w, http.StatusNotFound, "group tidak ditemukan")
 			return
 		}
-		h.redirectWith(w, r, "Akses grup ke database berhasil dicabut", "", http.StatusOK)
+		serverError(w, r, "gagal mengambil group", err)
 		return
 	}
-
-	if err := h.repo.SetGroupAccess(groupID, dbID, AccessLevel(level)); err != nil {
-		log.Printf("Gagal SetGroupAccess (group %d, db %d, level %d): %v", groupID, dbID, level, err)
-		h.redirectWith(w, r, "", "Gagal mengatur akses grup", http.StatusInternalServerError)
+	if _, err := h.repo.GetDatabase(req.DatabaseID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			auth.WriteError(w, http.StatusBadRequest, "database target tidak ditemukan")
+			return
+		}
+		serverError(w, r, "gagal mengambil database", err)
 		return
 	}
-
-	h.redirectWith(w, r, "Hak akses grup berhasil disimpan", "", http.StatusOK)
+	if req.AccessLevel == 0 {
+		err := h.repo.DeleteGroupAccess(groupID, req.DatabaseID)
+		if err != nil {
+			serverError(w, r, "gagal mencabut akses", err)
+			return
+		}
+	} else if err := h.repo.SetGroupAccess(groupID, req.DatabaseID, AccessLevel(req.AccessLevel)); err != nil {
+		serverError(w, r, "gagal mengatur akses", err)
+		return
+	}
+	audit(r, "admin.group.set_access", "group_id", groupID, "database_id", req.DatabaseID, "access_level", req.AccessLevel)
+	auth.WriteJSON(w, http.StatusOK, GroupAccess{GroupID: groupID, DatabaseID: req.DatabaseID, AccessLevel: AccessLevel(req.AccessLevel)})
 }
 
-// mendaftarkan koneksi ke database yang akan dikelola aksesnya
 func isValidSSLMode(mode string) bool {
 	switch mode {
 	case "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
 		return true
-	default:
-		return false
 	}
+	return false
 }
 
-func (h *AdminHandler) CreateDatabaseConnection(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+func (h *AdminHandler) ListTargets(w http.ResponseWriter, r *http.Request) {
+	dbs, err := h.repo.GetAllDatabases()
+	if err != nil {
+		serverError(w, r, "gagal mengambil daftar target", err)
 		return
 	}
+	if dbs == nil {
+		dbs = []Database{}
+	}
+	auth.WriteJSON(w, http.StatusOK, dbs) // PasswordEnc ber-tag json:"-"
+}
 
-	name := strings.TrimSpace(r.FormValue("name"))
-	host := strings.TrimSpace(r.FormValue("host"))
-	portStr := strings.TrimSpace(r.FormValue("port"))
-	dbName := strings.TrimSpace(r.FormValue("database_name"))
-	if dbName == "" {
-		dbName = strings.TrimSpace(r.FormValue("db_name"))
+func (h *AdminHandler) CreateTarget(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name         string `json:"name"`
+		Host         string `json:"host"`
+		Port         int    `json:"port"`
+		DatabaseName string `json:"database_name"`
+		Username     string `json:"username"`
+		Password     string `json:"password"`
+		SSLMode      string `json:"ssl_mode"`
 	}
-	username := strings.TrimSpace(r.FormValue("username"))
-	if username == "" {
-		username = strings.TrimSpace(r.FormValue("user"))
-	}
-	password := r.FormValue("password")
-	sslMode := strings.TrimSpace(r.FormValue("ssl_mode"))
-	if sslMode == "" {
-		sslMode = "prefer"
-	}
-
-	if name == "" || host == "" || dbName == "" || username == "" || password == "" {
-		h.redirectWith(w, r, "", "Field name, host, database_name, username, dan password wajib diisi", http.StatusBadRequest)
+	if !decodeBody(w, r, &req) {
 		return
 	}
-
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		h.redirectWith(w, r, "", "Port harus berupa angka antara 1 dan 65535", http.StatusBadRequest)
+	req.Name, req.Host = strings.TrimSpace(req.Name), strings.TrimSpace(req.Host)
+	req.DatabaseName, req.Username = strings.TrimSpace(req.DatabaseName), strings.TrimSpace(req.Username)
+	req.SSLMode = strings.TrimSpace(req.SSLMode)
+	if req.SSLMode == "" {
+		req.SSLMode = "prefer"
+	}
+	if req.Name == "" || req.Host == "" || req.DatabaseName == "" || req.Username == "" || req.Password == "" {
+		auth.WriteError(w, http.StatusBadRequest, "name, host, database_name, username, dan password wajib diisi")
 		return
 	}
-
-	if !isValidSSLMode(sslMode) {
-		h.redirectWith(w, r, "", "Nilai ssl_mode tidak valid", http.StatusBadRequest)
+	if req.Port < 1 || req.Port > 65535 {
+		auth.WriteError(w, http.StatusBadRequest, "port harus antara 1 dan 65535")
 		return
 	}
-
-	target := &dbtarget.Target{
-		Name:         name,
-		Host:         host,
-		Port:         port,
-		DatabaseName: dbName,
-		Username:     username,
-		SSLMode:      sslMode,
+	if !isValidSSLMode(req.SSLMode) {
+		auth.WriteError(w, http.StatusBadRequest, "ssl_mode tidak valid")
+		return
 	}
-
-	// Uji koneksi sebelum menyimpan jika manager terpasang
+	target := &dbtarget.Target{Name: req.Name, Host: req.Host, Port: req.Port, DatabaseName: req.DatabaseName, Username: req.Username, SSLMode: req.SSLMode}
 	if h.manager != nil {
 		testCtx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 		defer cancel()
-		if err := h.manager.TestConnection(testCtx, target, password); err != nil {
-			log.Printf("Uji koneksi gagal untuk target '%s': %v", name, err)
-			h.redirectWith(w, r, "", "Gagal menghubungi database target. Pastikan host, port, kredensial, dan status database benar.", http.StatusBadRequest)
+		if err := h.manager.TestConnection(testCtx, target, req.Password); err != nil {
+			slog.WarnContext(r.Context(), "uji koneksi target gagal", "event", "admin.target.test", "status", "failed", "target_name", req.Name, "err", err)
+			auth.WriteError(w, http.StatusBadRequest, "gagal menghubungi database target; periksa host, port, kredensial, dan status database")
 			return
 		}
 	}
-
-	// Enkripsi password dengan SecretBox
 	var passwordEnc []byte
 	if h.box != nil {
-		enc, err := h.box.Encrypt(password)
+		enc, err := h.box.Encrypt(req.Password)
 		if err != nil {
-			h.redirectWith(w, r, "", "Gagal mengenkripsi password database target", http.StatusInternalServerError)
+			serverError(w, r, "gagal mengenkripsi password target", err)
 			return
 		}
 		passwordEnc = enc
 	}
-
-	db := &Database{
-		Name:         name,
-		Host:         host,
-		Port:         port,
-		DatabaseName: dbName,
-		Username:     username,
-		PasswordEnc:  passwordEnc,
-		SSLMode:      sslMode,
-	}
-
+	db := &Database{Name: req.Name, Host: req.Host, Port: req.Port, DatabaseName: req.DatabaseName, Username: req.Username, PasswordEnc: passwordEnc, SSLMode: req.SSLMode}
 	if err := h.repo.CreateDatabase(db); err != nil {
-		log.Printf("Gagal mendaftarkan database %s: %v", name, err)
-		h.redirectWith(w, r, "", "Gagal mendaftarkan database ke sistem", http.StatusInternalServerError)
+		if isUniqueViolation(err) {
+			auth.WriteError(w, http.StatusConflict, "nama target sudah digunakan")
+			return
+		}
+		serverError(w, r, "gagal mendaftarkan target", err)
 		return
 	}
-
-	// Jika pemanggil mengharapkan JSON (API/curl)
-	if strings.Contains(r.Header.Get("Accept"), "application/json") {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"id":            db.ID,
-			"name":          db.Name,
-			"host":          db.Host,
-			"port":          db.Port,
-			"database_name": db.DatabaseName,
-			"username":      db.Username,
-			"ssl_mode":      db.SSLMode,
-		})
-		return
-	}
-
-	h.redirectWith(w, r, "Koneksi database '"+name+"' berhasil didaftarkan", "", http.StatusOK)
+	audit(r, "admin.target.create", "database_id", db.ID)
+	auth.WriteJSON(w, http.StatusCreated, db)
 }
 
-func (h *AdminHandler) DeleteDatabaseConnection(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+func (h *AdminHandler) DeleteTarget(w http.ResponseWriter, r *http.Request) {
+	dbID, ok := pathID(r, "id")
+	if !ok {
+		auth.WriteError(w, http.StatusBadRequest, "ID database tidak valid")
 		return
 	}
-
-	dbIDStr := r.FormValue("database_id")
-	if dbIDStr == "" {
-		dbIDStr = r.FormValue("db_id")
-	}
-	dbID, err := strconv.Atoi(dbIDStr)
-	if err != nil || dbID <= 0 {
-		h.redirectWith(w, r, "", "Database ID tidak valid", http.StatusBadRequest)
+	if _, err := h.repo.GetDatabase(dbID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			auth.WriteError(w, http.StatusNotFound, "database target tidak ditemukan")
+			return
+		}
+		serverError(w, r, "gagal mengambil target", err)
 		return
 	}
-
-	// Hapus koneksi dari database
 	if err := h.repo.DeleteDatabase(dbID); err != nil {
-		log.Printf("Gagal menghapus database %d: %v", dbID, err)
-		h.redirectWith(w, r, "", "Gagal menghapus database target", http.StatusInternalServerError)
+		serverError(w, r, "gagal menghapus target", err)
 		return
 	}
-
-	// SETELAH penghapusan: panggil Manager.Invalidate(id)
 	if h.manager != nil {
 		h.manager.Invalidate(int64(dbID))
 	}
-
-	h.redirectWith(w, r, "Koneksi database berhasil dihapus", "", http.StatusOK)
-}
-
-func (h *AdminHandler) redirectWith(w http.ResponseWriter, r *http.Request, msg, errMsg string, apiStatusCode int) {
-	// Cek jika pemanggil adalah API murni (bukan form browser)
-	isHTMLForm := r.Header.Get("Content-Type") == "application/x-www-form-urlencoded" ||
-		strings.Contains(r.Header.Get("Accept"), "text/html")
-
-	if !isHTMLForm && !strings.Contains(r.Header.Get("Referer"), "/admin") {
-		if errMsg != "" {
-			http.Error(w, errMsg, apiStatusCode)
-		} else {
-			w.WriteHeader(apiStatusCode)
-			if msg != "" {
-				w.Write([]byte(msg))
-			}
-		}
-		return
-	}
-
-	// Redirect 303 kembali ke /admin dengan query string
-	targetURL := "/admin"
-	params := url.Values{}
-	if msg != "" {
-		params.Set("msg", msg)
-	}
-	if errMsg != "" {
-		params.Set("err", errMsg)
-	}
-	if len(params) > 0 {
-		targetURL += "?" + params.Encode()
-	}
-
-	http.Redirect(w, r, targetURL, http.StatusSeeOther)
+	audit(r, "admin.target.delete", "database_id", dbID)
+	auth.WriteJSON(w, http.StatusOK, map[string]any{"deleted": dbID})
 }
