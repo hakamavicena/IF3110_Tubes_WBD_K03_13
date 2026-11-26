@@ -21,6 +21,7 @@ import (
 	"backend/dbengine/pkg/httpdb"
 	"backend/dbengine/pkg/migration"
 	"backend/dbengine/pkg/ports"
+	"backend/dbengine/pkg/queue"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
@@ -155,14 +156,41 @@ func main() {
 	migExecutor := &migration.Executor{StatementTimeout: timeout}
 	migService := migration.NewService(migRepo, authorizer, targetManager, migExecutor, timeout)
 
+	redisAddr := strings.TrimSpace(os.Getenv("REDIS_ADDR"))
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+	redisPass := os.Getenv("REDIS_PASSWORD")
+	redisQueueKey := strings.TrimSpace(os.Getenv("REDIS_QUEUE_KEY"))
+	var jobQueue queue.Queue = queue.NewRedisQueue(redisAddr, redisPass, redisQueueKey)
+	pingQueueCtx, cancelQueuePing := context.WithTimeout(ctx, 3*time.Second)
+	if err := jobQueue.Ping(pingQueueCtx); err != nil {
+		log.Printf("Peringatan: Redis (%s) belum dapat dihubungi (%v), menggunakan in-memory queue fallback", redisAddr, err)
+		jobQueue = queue.NewMemoryQueue()
+	}
+	cancelQueuePing()
+	defer jobQueue.Close()
+
+	lockManager := migration.NewLockManager(pgxPool)
+	jobCoordinator := migration.NewJobCoordinator(migRepo, lockManager, jobQueue, targetManager, migExecutor, authorizer, timeout)
+
 	recoverCtx, cancelRecover := context.WithTimeout(ctx, 10*time.Second)
 	recovered, err := migRepo.RecoverStuck(recoverCtx)
+	if recoveredJobs, recErr := jobCoordinator.RecoverOnStartup(recoverCtx, 15*time.Second); recErr != nil {
+		log.Printf("Peringatan: gagal memulihkan migration_jobs/locks saat startup: %v", recErr)
+	} else if recoveredJobs > 0 {
+		log.Printf("Berhasil memulihkan %d migration_jobs tertinggal saat startup", recoveredJobs)
+	}
 	cancelRecover()
 	if err != nil {
 		log.Printf("Peringatan: gagal memulihkan migration yang tertinggal: %v", err)
 	} else if recovered > 0 {
 		log.Printf("Berhasil menandai %d migration tertinggal (running) sebagai failed", recovered)
 	}
+
+	workerCtx, cancelWorkers := context.WithCancel(ctx)
+	defer cancelWorkers()
+	_ = jobCoordinator.StartWorkers(workerCtx, 3)
 
 	csrfTokenFunc := func(r *http.Request) string {
 		return auth.CSRFToken(r)
@@ -172,6 +200,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Gagal inisialisasi httpdb handler: %v", err)
 	}
+	jobAPIHandler := httpdb.NewJobAPIHandler(jobCoordinator)
 
 	mux := http.NewServeMux()
 
@@ -251,6 +280,7 @@ func main() {
 		})))
 	}
 	httpdbHandler.Register(mux, protectDB)
+	jobAPIHandler.RegisterRoutes(mux, protectDB)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
