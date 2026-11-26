@@ -17,6 +17,7 @@ func NewAuthorizer(service *AccessService, repo AccessRepository) *Authorizer {
 	return &Authorizer{service: service, repo: repo}
 }
 
+//menerjemahkan level akses dari modul ke level yg dimengerti dbengine
 func toPortsLevel(lvl AccessLevel) ports.Level {
 	switch lvl {
 	case AccessViewOnly:

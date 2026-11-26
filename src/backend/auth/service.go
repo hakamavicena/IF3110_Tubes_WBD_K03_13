@@ -197,16 +197,22 @@ func (s *AuthService) ValidateAndRotateSession(sessionID string) (*Session, stri
 	return session, "", nil
 }
 
-// RotateSession menerbitkan ID baru secara manual (misal saat privilege naik)
 func (s *AuthService) RotateSession(oldSessionID string) (*Session, error) {
 	session, err := s.repo.GetSession(oldSessionID)
 	if err != nil {
 		return nil, err
 	}
-
 	now := s.now()
-	if now.After(session.AbsoluteExpiration) {
-		_ = s.repo.DeleteSession(oldSessionID)
+	if oldSessionID == session.PreviousID && now.After(session.PreviousValidUntil) {
+		return nil, ErrSessionExpired
+	}
+	if now.After(session.AbsoluteExpiration) || now.Sub(session.LastActivity) > s.config.IdleTimeout {
+		_ = s.repo.DeleteSession(session.SessionID)
+		return nil, ErrSessionExpired
+	}
+	user, err := s.repo.GetUserByID(session.UserID)
+	if err != nil || !user.IsActive {
+		_ = s.repo.DeleteSession(session.SessionID)
 		return nil, ErrSessionExpired
 	}
 
@@ -214,11 +220,17 @@ func (s *AuthService) RotateSession(oldSessionID string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	newCSRF, err := GenerateRandomToken(32)
+	if err != nil {
+		return nil, err
+	}
 
+	oldID := session.SessionID
 	_ = s.repo.DeleteSession(session.SessionID)
-	session.PreviousID = session.SessionID
+	session.PreviousID = oldID
 	session.PreviousValidUntil = now.Add(s.config.GracePeriod)
 	session.SessionID = newID
+	session.CSRFToken = newCSRF
 	session.CreatedAt = now
 	session.LastActivity = now
 
@@ -226,6 +238,10 @@ func (s *AuthService) RotateSession(oldSessionID string) (*Session, error) {
 		return nil, err
 	}
 	return session, nil
+}
+
+func (s *AuthService) GetUser(userID int) (*User, error) {
+	return s.repo.GetUserByID(userID)
 }
 
 func (s *AuthService) InvalidateUserSessions(userID int) error {

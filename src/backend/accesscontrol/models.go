@@ -5,10 +5,15 @@ import "errors"
 // definisiin hak akses terhadap suatu database
 type AccessLevel int
 
+// File ini adalah "kamus" yang mendefinisikan bentuk tipe data (struct) 
+// dan error standar yang akan dipakai oleh seluruh file lain di modul ini.
+
+// Spek meminta adanya User, Grup, Database, dan tingkat akses (View Only / View + Edit). 
+// Di sinilah hal itu diterjemahkan ke kode Golang.
 const (
-	AccessNone AccessLevel = iota
-	AccessViewOnly
-	AccessViewEdit
+	AccessNone AccessLevel = iota // bernilai 0
+	AccessViewOnly // bernilai 1
+	AccessViewEdit // bernilai 2
 )
 
 type User struct {

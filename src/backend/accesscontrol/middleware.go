@@ -6,8 +6,7 @@ import (
 	"strconv"
 )
 
-// Ini dipake barengan, buat bungkus endpoint hakam (view schema atau run migration)
-// butuh requiredLevel (misal AccessViewEdit kalo mau migrasi
+//dead code
 func RequireDBAccess(service *AccessService, requiredLevel AccessLevel, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		session, ok := r.Context().Value(auth.SessionContextKey).(*auth.Session)

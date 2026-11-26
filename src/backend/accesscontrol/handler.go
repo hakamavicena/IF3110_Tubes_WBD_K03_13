@@ -59,7 +59,9 @@ type AdminPageData struct {
 	Error     string
 }
 
+// Menampilkan dashboard admin
 func (h *AdminHandler) AdminDashboard(w http.ResponseWriter, r *http.Request) {
+	// memastikan request menggunakan get
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -72,6 +74,7 @@ func (h *AdminHandler) AdminDashboard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Gagal memuat data pengguna", http.StatusInternalServerError)
 		return
 	}
+	//Membentuk data semua group yang diikuti masing-masing user
 	var usersWithGroups []UserWithGroups
 	for _, u := range rawUsers {
 		grps, _ := h.repo.GetGroupsByUserID(u.ID)
@@ -88,6 +91,7 @@ func (h *AdminHandler) AdminDashboard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Gagal memuat data grup", http.StatusInternalServerError)
 		return
 	}
+	// melihat detail grup lalu mengambil member dan grant nya
 	var groupDetails []GroupDetail
 	for _, g := range rawGroups {
 		members, _ := h.repo.GetGroupMembers(g.ID)
@@ -142,12 +146,17 @@ func (h *AdminHandler) AdminDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+
+// Diatas itu keseluruhan alur admindashboard ngambil data terus diberikan ke page
+
 func (h *AdminHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
+	// Mastiin menggunakan post untuk ngubah data
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	//ngambil input dari form
 	username := strings.TrimSpace(r.FormValue("username"))
 	password := r.FormValue("password")
 	isAdminVal := r.FormValue("is_admin")
@@ -185,6 +194,7 @@ func (h *AdminHandler) SetUserStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	//ngambil id user
 	userIDStr := r.FormValue("user_id")
 	targetID, err := strconv.Atoi(userIDStr)
 	if err != nil || targetID <= 0 {
@@ -194,7 +204,7 @@ func (h *AdminHandler) SetUserStatus(w http.ResponseWriter, r *http.Request) {
 
 	action := strings.TrimSpace(r.FormValue("action"))
 
-	// Ambil ID user yang sedang login
+	// Ambil ID admin yang sedang login
 	currentUserID, _ := auth.UserIDFromContext(r.Context())
 
 	if action == "deactivate" {
@@ -355,6 +365,7 @@ func (h *AdminHandler) SetGroupAccess(w http.ResponseWriter, r *http.Request) {
 	h.redirectWith(w, r, "Hak akses grup berhasil disimpan", "", http.StatusOK)
 }
 
+// mendaftarkan koneksi ke database yang akan dikelola aksesnya
 func isValidSSLMode(mode string) bool {
 	switch mode {
 	case "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
