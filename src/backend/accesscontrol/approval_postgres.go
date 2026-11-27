@@ -127,6 +127,9 @@ func (t *pgApprovalTx) SetStatus(ctx context.Context, from, to string) (bool, er
 		return false, err
 	}
 	n, _ := res.RowsAffected()
+	if n == 1 {
+		_, _ = t.tx.ExecContext(ctx, `UPDATE migrations SET status = $2 WHERE id = (SELECT migration_id FROM migration_jobs WHERE id = $1)`, t.jobID, to)
+	}
 	return n == 1, nil
 }
 

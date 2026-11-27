@@ -785,8 +785,12 @@ func (r *PGRepository) CreateRollbackForwardJob(
 		snapshot = sqlDown
 		revertsExecID = activeExecID
 	case JobActionForward:
-		if ActiveState(activeState) != ActiveStateRolledBack || Status(status) != StatusSuccess {
-			return nil, nil, fmt.Errorf("%w: hanya migration yang sudah di-rollback yang dapat di-forward", apperr.ErrNotExecutable)
+		canForwardRolledBack := ActiveState(activeState) == ActiveStateRolledBack &&
+			(Status(status) == StatusSuccess || Status(status) == StatusFailed)
+		canRetryFailedApply := ActiveState(activeState) == ActiveStateNotApplied &&
+			Status(status) == StatusFailed
+		if !canForwardRolledBack && !canRetryFailedApply {
+			return nil, nil, fmt.Errorf("%w: hanya migration yang sudah di-rollback atau attempt gagal yang dapat di-forward kembali", apperr.ErrNotExecutable)
 		}
 		var earlierRolledBack bool
 		if err := tx.QueryRow(ctx, `
