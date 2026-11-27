@@ -53,7 +53,7 @@ export default function TargetsPanel() {
           <Field label="Port"><Input type="number" min={1} max={65535} required value={form.port} onChange={set("port")} /></Field>
           <Field label="Nama database"><Input required value={form.database_name} onChange={set("database_name")} /></Field>
           <Field label="Username"><Input required value={form.username} onChange={set("username")} /></Field>
-          <Field label="Password" hint="Disimpan terenkripsi, tidak pernah ditampilkan lagi">
+          <Field label="Password">
             <Input type="password" autoComplete="new-password" required value={form.password} onChange={set("password")} />
           </Field>
           <Field label="SSL mode">
