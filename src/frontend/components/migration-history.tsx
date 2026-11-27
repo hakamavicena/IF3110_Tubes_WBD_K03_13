@@ -134,9 +134,28 @@ export function MigrationHistory({ databaseId }: { databaseId: string }) {
         `/api/databases/${encodeURIComponent(databaseId)}/migrations/${target.migrationId}/${target.action}`,
         { method: "POST" },
       );
+      try {
+        await apiRequest<Record<string, unknown>>(
+          `/api/databases/${encodeURIComponent(databaseId)}/jobs/${result.job_id}/submit-review`,
+          { method: "POST" },
+        );
+      } catch (reviewError) {
+        setNotice({
+          kind: "error",
+          text: `Job #${result.job_id} dibuat sebagai draft, tetapi gagal diajukan untuk review: ${
+            reviewError instanceof Error
+              ? reviewError.message
+              : "kesalahan tidak diketahui"
+          }. Buka detail migration untuk mengajukannya secara manual.`,
+        });
+        setLoading(true);
+        setError(null);
+        setReloadCount((count) => count + 1);
+        return;
+      }
       setNotice({
         kind: "success",
-        text: `Pengajuan ${target.action} dibuat (job #${result.job_id}, status ${result.status}). Ajukan review, minta approval semua group leader, lalu enqueue dari halaman Migrations.`,
+        text: `Pengajuan ${target.action} dibuat dan dikirim untuk review (job #${result.job_id}). Setelah semua group leader menyetujui, enqueue job dari halaman Migrations.`,
       });
       setLoading(true);
       setError(null);

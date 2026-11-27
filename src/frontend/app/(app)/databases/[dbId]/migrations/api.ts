@@ -161,6 +161,16 @@ export async function updateMigration(
   );
 }
 
+export async function submitJobForReview(
+  dbId: string | number,
+  jobId: string | number
+): Promise<void> {
+  await requestJSON<unknown>(
+    `/api/databases/${dbId}/jobs/${jobId}/submit-review`,
+    { method: "POST" }
+  );
+}
+
 export async function enqueueJob(
   dbId: string | number,
   jobId: string | number

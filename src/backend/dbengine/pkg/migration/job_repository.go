@@ -661,6 +661,11 @@ func (r *PGRepository) UpdateDraftWithJob(ctx context.Context, databaseID, migra
 		return nil, nil, err
 	}
 
+	// Approvals for the previous SQL snapshot must not carry over to the revision.
+	if _, err := tx.Exec(ctx, `DELETE FROM migration_approvals WHERE job_id = $1`, jobID); err != nil {
+		return nil, nil, err
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, nil, err
 	}

@@ -7,6 +7,7 @@ import {
   ExecutionMode,
   MigrationItem,
   MigrationUpsertPayload,
+  submitJobForReview,
   updateMigration,
 } from "../api";
 
@@ -126,6 +127,20 @@ export default function MigrationEditorForm({
         router.push(`/databases/${dbId}/migrations/${res.migration.id}`);
       } else if (initialMigration) {
         const res = await updateMigration(dbId, initialMigration.id, payload);
+        if (initialMigration.status === "failed") {
+          try {
+            await submitJobForReview(dbId, res.job.id);
+          } catch (reviewErr) {
+            setError(
+              `Migration tersimpan, tetapi gagal diajukan untuk review: ${
+                reviewErr instanceof Error
+                  ? reviewErr.message
+                  : "kesalahan tidak diketahui"
+              }`
+            );
+            return;
+          }
+        }
         router.push(`/databases/${dbId}/migrations/${res.migration.id}`);
       }
     } catch (err) {
