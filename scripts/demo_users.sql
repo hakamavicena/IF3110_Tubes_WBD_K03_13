@@ -9,11 +9,12 @@ INSERT INTO users (username, password_hash, is_admin, is_active) VALUES
 ('outsider', '$2a$10$jr92yrACh1xNQqF/5GtJD.yeiKE8ebSzOdcB4aq08GSUpxzmzqd/i', false, true)
 ON CONFLICT (username) DO NOTHING;
 
--- 2. Insert grup demo
-INSERT INTO groups (name) VALUES
-('g_view'),
-('g_edit')
-ON CONFLICT (name) DO NOTHING;
+-- 2. Insert grup demo beserta penetapan Group Leader default (Milestone 2)
+INSERT INTO groups (name, leader_id) VALUES
+('g_view', (SELECT id FROM users WHERE username = 'viewer')),
+('g_edit', (SELECT id FROM users WHERE username = 'editor'))
+ON CONFLICT (name) DO UPDATE
+SET leader_id = COALESCE(groups.leader_id, EXCLUDED.leader_id);
 
 -- 3. Masukkan keanggotaan grup
 -- editor -> g_edit
