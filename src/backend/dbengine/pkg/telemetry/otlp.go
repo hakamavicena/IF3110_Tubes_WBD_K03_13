@@ -1,3 +1,5 @@
+//go:build otlp
+
 package telemetry
 
 import (

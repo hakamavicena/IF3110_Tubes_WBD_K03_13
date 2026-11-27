@@ -57,9 +57,20 @@ func TestPostgresRepository_Integration(t *testing.T) {
 
 	repo := NewPostgresRepository(db)
 
+	// Buat user sendiri; jangan mengandalkan user dengan ID 1 sudah ada di database.
+	var userID int
+	username := "it-session-" + uuid.New().String()
+	if err := db.QueryRow(
+		"INSERT INTO users (username, password_hash, is_admin, is_active) VALUES ($1, 'x', false, true) RETURNING id",
+		username,
+	).Scan(&userID); err != nil {
+		t.Fatalf("Gagal membuat user uji: %v", err)
+	}
+	defer db.Exec("DELETE FROM users WHERE id = $1", userID)
+
 	session := &Session{
 		SessionID:          uuid.New().String(),
-		UserID:             1,
+		UserID:             userID,
 		CreatedAt:          time.Now().Round(time.Microsecond),
 		LastActivity:       time.Now().Round(time.Microsecond),
 		AbsoluteExpiration: time.Now().Add(24 * time.Hour).Round(time.Microsecond),

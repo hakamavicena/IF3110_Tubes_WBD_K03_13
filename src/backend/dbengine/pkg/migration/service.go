@@ -11,6 +11,7 @@ import (
 	"backend/dbengine/pkg/apperr"
 	"backend/dbengine/pkg/dbtarget"
 	"backend/dbengine/pkg/ports"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -62,6 +63,21 @@ func (s *Service) List(ctx context.Context, userID, dbID int64) ([]Migration, er
 	return s.repo.List(ctx, dbID)
 }
 
+func (s *Service) History(
+	ctx context.Context,
+	userID, dbID int64,
+	hideRollback bool,
+) ([]Execution, error) {
+	if err := s.requireView(ctx, userID, dbID); err != nil {
+		return nil, err
+	}
+	executions, err := s.repo.ListHistory(ctx, dbID)
+	if err != nil {
+		return nil, err
+	}
+	return FilterHistory(executions, hideRollback), nil
+}
+
 func (s *Service) Get(ctx context.Context, userID, dbID, migrationID int64) (*Migration, error) {
 	if err := s.requireView(ctx, userID, dbID); err != nil {
 		return nil, err
@@ -76,24 +92,57 @@ func (s *Service) Get(ctx context.Context, userID, dbID, migrationID int64) (*Mi
 	return m, nil
 }
 
-func (s *Service) Create(ctx context.Context, userID, dbID int64, title, sql string) (*Migration, error) {
+func (s *Service) Create(
+	ctx context.Context,
+	userID, dbID int64,
+	title, sqlUp, sqlDown string,
+	isIrreversible bool,
+	irreversibleReason string,
+) (*Migration, error) {
 	if err := s.requireEdit(ctx, userID, dbID); err != nil {
 		return nil, err
 	}
-	if err := ValidateInput(title, sql); err != nil {
+	if err := ValidateDefinition(
+		title, sqlUp, sqlDown, isIrreversible, irreversibleReason,
+	); err != nil {
 		return nil, err
 	}
-	return s.repo.Create(ctx, &Migration{DatabaseID: dbID, Title: strings.TrimSpace(title), SQL: sql, CreatedBy: userID})
+
+	return s.repo.Create(ctx, &Migration{
+		DatabaseID:         dbID,
+		Title:              strings.TrimSpace(title),
+		SQL:                sqlUp,
+		SQLDown:            sqlDown,
+		IsIrreversible:     isIrreversible,
+		IrreversibleReason: strings.TrimSpace(irreversibleReason),
+		CreatedBy:          userID,
+	})
 }
 
-func (s *Service) Update(ctx context.Context, userID, dbID, migrationID int64, title, sql string) error {
+func (s *Service) Update(
+	ctx context.Context,
+	userID, dbID, migrationID int64,
+	title, sqlUp, sqlDown string,
+	isIrreversible bool,
+	irreversibleReason string,
+) error {
 	if err := s.requireEdit(ctx, userID, dbID); err != nil {
 		return err
 	}
-	if err := ValidateInput(title, sql); err != nil {
+	if err := ValidateDefinition(title, sqlUp, sqlDown, isIrreversible, irreversibleReason); err != nil {
 		return err
 	}
-	return s.repo.UpdateDraft(ctx, migrationID, dbID, strings.TrimSpace(title), sql)
+
+	return s.repo.UpdateDraft(
+		ctx,
+		migrationID,
+		dbID,
+		strings.TrimSpace(title),
+		sqlUp,
+		sqlDown,
+		isIrreversible,
+		strings.TrimSpace(irreversibleReason),
+	)
 }
 
 func (s *Service) Execute(ctx context.Context, userID, dbID, migrationID int64) (*Migration, error) {
@@ -132,6 +181,195 @@ func (s *Service) Execute(ctx context.Context, userID, dbID, migrationID int64) 
 		slog.Error("finish migration failed", "migration_id", migrationID, "status", status, "err", err)
 		return nil, err
 	}
+	_, err = s.repo.RecordExecution(context.WithoutCancel(ctx), &Execution{
+		DatabaseID:  dbID,
+		MigrationID: migrationID,
+		Version:     m.Version,
+		Revision:    1,
+		Title:       m.Title,
+		Action:      ActionApply,
+		SQLExecuted: sql,
+		ExecutedBy:  userID,
+		DurationMs:  durationMs,
+		Status:      status,
+	})
+	if err != nil {
+		slog.Error("record migration execution failed",
+			"migration_id", migrationID,
+			"status", status,
+			"err", err,
+		)
+		return nil, err
+	}
+	return s.repo.Get(ctx, migrationID)
+}
+
+func (s *Service) Rollback(
+	ctx context.Context,
+	userID, dbID, migrationID int64,
+) (*Migration, error) {
+	if err := s.requireEdit(ctx, userID, dbID); err != nil {
+		return nil, err
+	}
+	if s.execTimeout <= 0 {
+		return nil, fmt.Errorf("migration execution timeout must be positive")
+	}
+
+	m, err := s.repo.Get(ctx, migrationID)
+	if err != nil {
+		return nil, err
+	}
+	if m.DatabaseID != dbID {
+		return nil, apperr.ErrNotFound
+	}
+
+	sqlDown, revertedExecutionID, claimed, err :=
+		s.repo.ClaimRollback(ctx, migrationID, dbID)
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return nil, fmt.Errorf(
+			"%w: migration bukan yang terakhir aktif atau tidak dapat di-rollback",
+			apperr.ErrNotExecutable,
+		)
+	}
+
+	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.execTimeout)
+	defer cancel()
+
+	start := time.Now()
+	runErr := s.run(runCtx, dbID, sqlDown)
+	durationMs := int(time.Since(start).Milliseconds())
+
+	status, message := StatusSuccess, ""
+	if runErr != nil {
+		status, message = StatusFailed, describeError(runErr)
+	}
+	if err := s.repo.Finish(
+		context.WithoutCancel(ctx),
+		migrationID,
+		status,
+		message,
+		durationMs,
+	); err != nil {
+		slog.Error("finish rollback failed",
+			"migration_id", migrationID,
+			"status", status,
+			"err", err,
+		)
+		return nil, err
+	}
+
+	_, err = s.repo.RecordExecution(context.WithoutCancel(ctx),
+		&Execution{
+			DatabaseID:          dbID,
+			MigrationID:         migrationID,
+			Version:             m.Version,
+			Revision:            1,
+			Title:               m.Title,
+			Action:              ActionRollback,
+			SQLExecuted:         sqlDown,
+			ExecutedBy:          userID,
+			DurationMs:          durationMs,
+			Status:              status,
+			RevertedExecutionID: &revertedExecutionID,
+		},
+	)
+	if err != nil {
+		slog.Error("record rollback execution failed",
+			"migration_id", migrationID,
+			"status", status,
+			"err", err,
+		)
+		return nil, err
+	}
+
+	return s.repo.Get(ctx, migrationID)
+}
+
+func (s *Service) Forward(
+	ctx context.Context,
+	userID, dbID, migrationID int64,
+) (*Migration, error) {
+	if err := s.requireEdit(ctx, userID, dbID); err != nil {
+		return nil, err
+	}
+	if s.execTimeout <= 0 {
+		return nil, fmt.Errorf("migration execution timeout must be positive")
+	}
+
+	m, err := s.repo.Get(ctx, migrationID)
+	if err != nil {
+		return nil, err
+	}
+	if m.DatabaseID != dbID {
+		return nil, apperr.ErrNotFound
+	}
+
+	sqlUp, rollbackExecutionID, claimed, err :=
+		s.repo.ClaimForward(ctx, migrationID, dbID)
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return nil, fmt.Errorf(
+			"%w: migration belum dapat di-forward secara berurutan",
+			apperr.ErrNotExecutable,
+		)
+	}
+
+	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.execTimeout)
+	defer cancel()
+
+	start := time.Now()
+	runErr := s.run(runCtx, dbID, sqlUp)
+	durationMs := int(time.Since(start).Milliseconds())
+
+	status, message := StatusSuccess, ""
+	if runErr != nil {
+		status, message = StatusFailed, describeError(runErr)
+	}
+	if err := s.repo.Finish(
+		context.WithoutCancel(ctx),
+		migrationID,
+		status,
+		message,
+		durationMs,
+	); err != nil {
+		slog.Error("finish forward failed",
+			"migration_id", migrationID,
+			"status", status,
+			"err", err,
+		)
+		return nil, err
+	}
+
+	_, err = s.repo.RecordExecution(
+		context.WithoutCancel(ctx),
+		&Execution{
+			DatabaseID:          dbID,
+			MigrationID:         migrationID,
+			Version:             m.Version,
+			Revision:            1,
+			Title:               m.Title,
+			Action:              ActionForward,
+			SQLExecuted:         sqlUp,
+			ExecutedBy:          userID,
+			DurationMs:          durationMs,
+			Status:              status,
+			RevertedExecutionID: &rollbackExecutionID,
+		},
+	)
+	if err != nil {
+		slog.Error("record forward execution failed",
+			"migration_id", migrationID,
+			"status", status,
+			"err", err,
+		)
+		return nil, err
+	}
+
 	return s.repo.Get(ctx, migrationID)
 }
 

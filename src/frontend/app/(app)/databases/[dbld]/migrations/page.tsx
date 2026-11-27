@@ -39,6 +39,7 @@ export default function MigrationListPage() {
   }, [dbId]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch saat mount; state baru diset setelah await
     void loadData();
   }, [loadData]);
 

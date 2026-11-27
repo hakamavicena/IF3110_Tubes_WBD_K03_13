@@ -11,6 +11,8 @@ import (
 	"backend/dbengine/pkg/apperr"
 	"backend/dbengine/pkg/ports"
 	"backend/dbengine/pkg/queue"
+	"backend/dbengine/pkg/telemetry"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type JobCoordinator struct {
@@ -113,6 +115,25 @@ func (jc *JobCoordinator) RequestBatchRecovery(
 	return jc.repo.CreateBatchRecoveryJob(ctx, databaseID, migrationID, userID, action)
 }
 
+// RequestRollbackForward membuat job rollback/forward berstatus draft. Eksekusi
+// baru terjadi setelah approval semua group leader dan enqueue eksplisit.
+func (jc *JobCoordinator) RequestRollbackForward(
+	ctx context.Context,
+	userID, databaseID, migrationID int64,
+	action JobAction,
+) (*Migration, *Job, error) {
+	if jc.authz != nil {
+		canEdit, err := jc.authz.CanEdit(ctx, userID, databaseID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !canEdit {
+			return nil, nil, fmt.Errorf("%w: user %d does not have edit access to database %d", apperr.ErrForbidden, userID, databaseID)
+		}
+	}
+	return jc.repo.CreateRollbackForwardJob(ctx, databaseID, migrationID, userID, action)
+}
+
 func (jc *JobCoordinator) ListMigrationsM2(ctx context.Context, userID, databaseID int64) ([]Migration, bool, *DatabaseLock, error) {
 	if jc.authz != nil {
 		canView, err := jc.authz.CanView(ctx, userID, databaseID)
@@ -199,10 +220,17 @@ func (jc *JobCoordinator) RecoverOnStartup(ctx context.Context, staleThreshold t
 		return 0, err
 	}
 
+	// Hanya job 'running' yang lock-nya sudah basi (RecoverStaleLocks menandainya
+	// 'uncertain') atau tidak punya lock sama sekali yang dianggap tertinggal.
+	// Job yang heartbeat-nya masih segar milik instance lain dan tidak boleh disentuh,
+	// sehingga menyalakan instance kedua tidak mematikan job yang sedang berjalan.
 	rows, err := jc.repo.db.Query(ctx, `
-		SELECT id, database_id, execution_mode, committed_batches
-		FROM migration_jobs
-		WHERE status = 'running'`)
+		SELECT j.id, j.database_id, j.execution_mode, j.committed_batches
+		FROM migration_jobs j
+		LEFT JOIN database_migration_locks l
+		       ON l.database_id = j.database_id AND l.job_id = j.id
+		WHERE j.status = 'running'
+		  AND (l.job_id IS NULL OR l.lock_state = 'uncertain')`)
 	if err != nil {
 		return staleLocks, err
 	}
@@ -295,7 +323,20 @@ func (jc *JobCoordinator) workerLoop(ctx context.Context, workerID string) {
 	}
 }
 
+// ProcessMessage melanjutkan trace dari API (traceparent yang dibawa pesan queue)
+// lalu menjalankan job di dalam span worker.
 func (jc *JobCoordinator) ProcessMessage(ctx context.Context, workerID string, msg queue.JobMessage) error {
+	ctx = telemetry.ExtractTraceParent(ctx, msg.TraceParent)
+	ctx, span := telemetry.StartSpan(ctx, "worker.process_job",
+		attribute.Int64("job.id", msg.JobID),
+		attribute.Int64("database.id", msg.DatabaseID),
+	)
+	err := jc.processMessage(ctx, workerID, msg)
+	telemetry.EndSpan(span, err)
+	return err
+}
+
+func (jc *JobCoordinator) processMessage(ctx context.Context, workerID string, msg queue.JobMessage) error {
 	job, err := jc.repo.GetJob(ctx, msg.DatabaseID, msg.JobID)
 	if err != nil {
 		return err

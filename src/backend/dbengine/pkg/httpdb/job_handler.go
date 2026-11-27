@@ -8,6 +8,7 @@ import (
 
 	"backend/dbengine/pkg/apperr"
 	"backend/dbengine/pkg/migration"
+	"backend/dbengine/pkg/telemetry"
 )
 
 type JobAPIHandler struct {
@@ -30,6 +31,10 @@ func (jh *JobAPIHandler) RegisterRoutes(mux *http.ServeMux, protect func(http.Ha
 	route("GET /api/databases/{dbID}/jobs/{jobID}", jh.getJobStatus)
 	route("POST /api/databases/{dbID}/migrations/{migID}/retry-batch", jh.retryBatch)
 	route("POST /api/databases/{dbID}/migrations/{migID}/cancel-batch", jh.cancelBatch)
+
+	// Rollback/forward hanya membuat job draft. Eksekusi selalu lewat approval dan queue.
+	route("POST /api/databases/{dbID}/migrations/{migID}/rollback", jh.rollbackMigration)
+	route("POST /api/databases/{dbID}/migrations/{migID}/forward", jh.forwardMigration)
 
 	route("GET /api/databases/{dbID}/migrations", jh.listMigrationsJSON)
 	route("POST /api/databases/{dbID}/migrations", jh.createMigrationJSON)
@@ -169,7 +174,7 @@ func toLockDTO(l *migration.DatabaseLock) *lockDTO {
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(payload)
 }
@@ -238,6 +243,10 @@ func (jh *JobAPIHandler) enqueueJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	traceParent := r.Header.Get("traceparent")
+	if traceParent == "" {
+		// Middleware telemetry sudah membuat span HTTP; teruskan konteksnya lewat queue ke worker.
+		traceParent = telemetry.InjectTraceParent(r.Context())
+	}
 	job, err := jh.coordinator.EnqueueJob(r.Context(), userID, dbID, jobID, traceParent)
 	if err != nil {
 		writeJSONError(w, err)
@@ -481,5 +490,41 @@ func (jh *JobAPIHandler) updateMigrationJSON(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, map[string]any{
 		"migration": toMigrationDTO(mig),
 		"job":       toJobDTO(job),
+	})
+}
+
+func (jh *JobAPIHandler) rollbackMigration(w http.ResponseWriter, r *http.Request) {
+	jh.requestRollbackForward(w, r, migration.JobActionRollback)
+}
+
+func (jh *JobAPIHandler) forwardMigration(w http.ResponseWriter, r *http.Request) {
+	jh.requestRollbackForward(w, r, migration.JobActionForward)
+}
+
+func (jh *JobAPIHandler) requestRollbackForward(w http.ResponseWriter, r *http.Request, action migration.JobAction) {
+	userID, ok := requireJSONUserID(w, r)
+	if !ok {
+		return
+	}
+	dbID, ok := parseJSONPathID(w, r, "dbID")
+	if !ok {
+		return
+	}
+	migID, ok := parseJSONPathID(w, r, "migID")
+	if !ok {
+		return
+	}
+
+	mig, job, err := jh.coordinator.RequestRollbackForward(r.Context(), userID, dbID, migID, action)
+	if err != nil {
+		writeJSONError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"job_id":    job.ID,
+		"status":    string(job.Status),
+		"job":       toJobDTO(job),
+		"migration": toMigrationDTO(mig),
 	})
 }

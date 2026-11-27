@@ -364,14 +364,14 @@ func TestSession_Logout(t *testing.T) {
 		t.Errorf("Expected 403 Forbidden for POST /logout without CSRF, got %d", recPostNoCSRF.Code)
 	}
 
-	// Logout dengan POST dan CSRF token valid -> 303 See Other
+	// Logout dengan POST dan CSRF token valid -> 200 OK (JSON)
 	reqPostValid := httptest.NewRequest("POST", "/logout", strings.NewReader("csrf_token="+sess.CSRFToken))
 	reqPostValid.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	reqPostValid.AddCookie(&http.Cookie{Name: "session_id", Value: sess.SessionID})
 	recPostValid := httptest.NewRecorder()
 	handler.LogoutHandler(recPostValid, reqPostValid)
-	if recPostValid.Code != http.StatusSeeOther {
-		t.Errorf("Expected 303 See Other for valid logout, got %d", recPostValid.Code)
+	if recPostValid.Code != http.StatusOK {
+		t.Errorf("Expected 200 OK for valid logout, got %d", recPostValid.Code)
 	}
 
 	// Replay cookie lama setelah logout -> Ditolak (Session expired or invalid)

@@ -9,6 +9,7 @@ import {
   requestCancelBatch,
   requestRetryBatch,
 } from "../api";
+import ApprovalPanel from "@/components/ApprovalPanel";
 
 interface JobProgressMonitorProps {
   dbId: string | number;
@@ -55,6 +56,7 @@ export default function JobProgressMonitor({
   const [actionError, setActionError] = useState<string | null>(null);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- sinkronisasi state lokal dengan prop saat job awal berganti
     setJob(initialJob);
   }, [initialJob]);
 
@@ -241,6 +243,22 @@ export default function JobProgressMonitor({
             atau <strong>Cancel / Revert Batch</strong> untuk membatalkan batch
             dalam urutan terbalik (LIFO).
           </p>
+        </div>
+      )}
+
+      {(job.status === "draft" || job.status === "pending_review" || job.status === "approved") && (
+        <div className="mt-4">
+          <ApprovalPanel
+            dbId={Number(dbId)}
+            jobId={job.id}
+            onChange={(s) => {
+              if (s.status !== job.status) {
+                const next = { ...job, status: s.status as MigrationStatus };
+                setJob(next);
+                onJobUpdated?.(next);
+              }
+            }}
+          />
         </div>
       )}
 

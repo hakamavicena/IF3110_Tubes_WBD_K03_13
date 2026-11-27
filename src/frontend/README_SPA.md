@@ -16,3 +16,11 @@ Folder `src/frontend` digunakan untuk mengimplementasikan Single-Page Applicatio
    - **Modul 1**: Halaman Daftar & Detail Migration (`/databases/[dbId]/migrations`, `/databases/[dbId]/migrations/[migId]`).
    - **Modul 2**: Halaman Form Create/Edit Migration (SQL Up, SQL Down / Irreversible, mode Biasa vs Per Batch `batch_column` & `batch_size`).
    - **Modul 3**: Komponen Real-Time Job & Batch Progress Monitor (progres batch, jumlah row committed, Retry dari Checkpoint, & Cancel/Revert Batch).
+
+## Integrasi modul Dashboard, Detail Tabel, History Migration
+
+- Dashboard dan explorer memakai API database, schema, dan daftar tabel.
+- Detail tabel memakai endpoint metadata dan data paginasi (`page` dan `size`).
+- History memakai `GET /api/databases/{dbId}/history`; checkbox **Hide Rollback** mengirim `hide_rollback=true`.
+- Tombol Rollback dan Forward memakai endpoint aksi migration dan meminta konfirmasi sebelum mengirim `POST`.
+- Permintaan mutasi memerlukan CSRF token. API client memakai token yang disimpan melalui `storeCsrfToken`; jika belum tersedia, client mencoba mengambilnya dari `GET /api/auth/me`. Integrasi login perlu mengisi token atau menyediakan kontrak endpoint tersebut.

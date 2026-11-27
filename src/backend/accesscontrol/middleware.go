@@ -6,7 +6,7 @@ import (
 	"strconv"
 )
 
-//dead code
+// dead code
 func RequireDBAccess(service *AccessService, requiredLevel AccessLevel, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		session, ok := r.Context().Value(auth.SessionContextKey).(*auth.Session)
@@ -39,11 +39,11 @@ func RequireAdmin(service *AccessService, next http.HandlerFunc) http.HandlerFun
 	return func(w http.ResponseWriter, r *http.Request) {
 		session, ok := r.Context().Value(auth.SessionContextKey).(*auth.Session)
 		if !ok || session == nil {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			auth.WriteError(w, http.StatusUnauthorized, "Unauthorized")
 			return
 		}
 		if err := service.RequirePlatformAdmin(session.UserID); err != nil {
-			http.Error(w, "Forbidden: Platform Admin only", http.StatusForbidden)
+			auth.WriteError(w, http.StatusForbidden, "Forbidden: Platform Admin only")
 			return
 		}
 		next.ServeHTTP(w, r)

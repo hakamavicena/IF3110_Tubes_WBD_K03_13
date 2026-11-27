@@ -1,3 +1,5 @@
+import { apiRequest } from "@/lib/api";
+
 export type ExecutionMode = "standard" | "batch";
 
 export type MigrationStatus =
@@ -112,42 +114,9 @@ export interface MigrationUpsertPayload {
   batch_size: number;
 }
 
-function getStoredCSRFToken(): string {
-  if (typeof window === "undefined") {
-    return "";
-  }
-  return (
-    window.localStorage.getItem("csrf_token") ||
-    window.sessionStorage.getItem("csrf_token") ||
-    ""
-  );
-}
-
-async function requestJSON<T>(url: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers || {});
-  if (!headers.has("Content-Type") && init?.body) {
-    headers.set("Content-Type", "application/json");
-  }
-  const csrf = getStoredCSRFToken();
-  if (csrf && !headers.has("X-CSRF-Token")) {
-    headers.set("X-CSRF-Token", csrf);
-  }
-
-  const res = await fetch(url, {
-    ...init,
-    credentials: "include",
-    headers,
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const errMsg =
-      typeof data?.error === "string"
-        ? data.error
-        : `HTTP Error ${res.status}`;
-    throw new Error(errMsg);
-  }
-  return data as T;
+// Memakai klien bersama (@/lib/api): satu sumber CSRF, 401 ditangani terpusat.
+function requestJSON<T>(url: string, init?: RequestInit): Promise<T> {
+  return apiRequest<T>(url, init);
 }
 
 export async function fetchMigrations(

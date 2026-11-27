@@ -120,6 +120,15 @@ Daftar Akun Pengguna Demo (Password: `password123`):
    - Pilih Grup `g_view` -> Database `demo_target` -> Level: `View Only (Level 1)`.
    - Pilih Grup `g_edit` -> Database `demo_target` -> Level: `View + Edit (Level 2)`.
 
+### Langkah 4.4: Siapkan Dataset Besar untuk Pengujian Migration Batch
+Pastikan layanan `pg_target2` dari Docker Compose berjalan, lalu jalankan dari root repository:
+```powershell
+Get-Content scripts\seed_large_migration_dataset.sql -Raw | docker compose exec -T pg_target2 psql -U app -d target2_db -v ON_ERROR_STOP=1 -f -
+```
+Skrip ini hanya berjalan pada database `target2_db` dan membuat tabel khusus `large_migration_dataset` dengan primary key `id` yang dapat digunakan sebagai batch cursor. Skrip mengosongkan ulang tabel khusus tersebut saat dijalankan kembali, lalu mengukur satu query `UPDATE` penuh. Jika durasinya belum mencapai 1 detik, jumlah row diperbesar otomatis sampai batas `maximum_rows` (default 2 juta); bila batas itu belum cukup, skrip gagal dengan pesan agar batas dinaikkan.
+
+Hasil pengukuran ditampilkan sebagai `rows_affected` dan `duration_ms`, serta disimpan di `large_dataset_benchmark_runs`. Simpan hasil tersebut untuk laporan pengujian. Dataset yang sama tetap tersedia di `large_migration_dataset` untuk pengujian migration per batch; gunakan `id` sebagai kolom cursor dan ukuran batch awal 10.000. Skrip memperbarui `payload` untuk benchmark tanpa mengubah `id`, sehingga cursor tetap unik dan stabil.
+
 ---
 
 ## 5. Menjalankan Pengujian
@@ -179,6 +188,7 @@ IF3110_Tubes_WBD_K03_13/
 ├── scripts/
 │   ├── demo_target.sql            # Skema dan data dummy database demo target
 │   ├── demo_users.sql             # User, grup, dan keanggotaan demo
+│   ├── seed_large_migration_dataset.sql # Dataset besar dan benchmark UPDATE
 │   └── smoke.ps1                  # Otomatisasi pengujian 10 skenario end-to-end
 └── src/
     ├── frontend/

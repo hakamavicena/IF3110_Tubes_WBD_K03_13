@@ -4,13 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
-	"html/template"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"backend/accesscontrol"
@@ -20,29 +22,16 @@ import (
 	"backend/dbengine/pkg/dbviewer"
 	"backend/dbengine/pkg/httpdb"
 	"backend/dbengine/pkg/migration"
-	"backend/dbengine/pkg/ports"
 	"backend/dbengine/pkg/queue"
+	"backend/dbengine/pkg/telemetry"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
 
-func findTemplatePath(filename string) string {
-	candidates := []string{
-		filepath.Join("..", "frontend", "templates", filename),
-		filepath.Join("frontend", "templates", filename),
-		filepath.Join("src", "frontend", "templates", filename),
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return filepath.Join("..", "frontend", "templates", filename)
-}
-
 func main() {
+	telemetry.SetupLogging()
 	if err := godotenv.Load(); err != nil {
 		log.Println("Tidak ada file .env, menggunakan variabel environment OS")
 	}
@@ -111,16 +100,27 @@ func main() {
 
 	accessRepo := accesscontrol.NewPostgresRepository(db)
 	accessService := accesscontrol.NewAccessService(accessRepo)
+	authHandler.SetLeaderGroupsFunc(func(userID int) ([]auth.LeaderGroup, error) {
+		groups, err := accessRepo.GetLeaderGroups(userID)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]auth.LeaderGroup, 0, len(groups))
+		for _, g := range groups {
+			out = append(out, auth.LeaderGroup{ID: g.ID, Name: g.Name})
+		}
+		return out, nil
+	})
 
 	targetRepo := dbtarget.NewPGTargetRepository(pgxPool)
 	targetManager := dbtarget.NewManager(targetRepo, box)
 	defer targetManager.Close()
 
 	adminHandler := accesscontrol.NewAdminHandler(accessService, accessRepo, targetManager, box)
-	adminHandler.SetTemplatePath(findTemplatePath("admin.html"))
 	adminHandler.SetSessionInvalidator(func(userID int) error {
 		return authService.InvalidateUserSessions(userID)
 	})
+	adminHandler.SetSessionRotator(authHandler.RotateCurrentSession)
 
 	adminCount, err := accessRepo.GetActiveAdminCount()
 	if err != nil {
@@ -136,8 +136,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Gagal hash password bootstrap admin: %v", err)
 		}
-		_, err = accessRepo.CreateUserWithPassword(adminUser, string(hash), true)
-		if err != nil {
+		if _, err = accessRepo.CreateUserWithPassword(adminUser, string(hash), true); err != nil {
 			log.Fatalf("Gagal membuat user admin bootstrap: %v", err)
 		}
 		log.Printf("Bootstrap admin '%s' berhasil dibuat", adminUser)
@@ -145,6 +144,15 @@ func main() {
 
 	authorizer := accesscontrol.NewAuthorizer(accessService, accessRepo)
 	viewerService := dbviewer.NewService(authorizer, targetManager)
+
+	// Observability: tracing (exporter console) + metrik Prometheus.
+	shutdownTracing, err := telemetry.InitTracing(ctx, "dbplatform-backend")
+	if err != nil {
+		log.Printf("Peringatan: gagal inisialisasi tracing: %v", err)
+		shutdownTracing = func(context.Context) error { return nil }
+	}
+	metrics := telemetry.NewMetrics()
+	metrics.RegisterPool("internal", func() telemetry.PoolStat { return telemetry.PGXPoolStat(pgxPool) })
 
 	migRepo := migration.NewPGRepository(pgxPool)
 	timeout := 30 * time.Second
@@ -174,106 +182,48 @@ func main() {
 	lockManager := migration.NewLockManager(pgxPool)
 	jobCoordinator := migration.NewJobCoordinator(migRepo, lockManager, jobQueue, targetManager, migExecutor, authorizer, timeout)
 
+	// Pemulihan hanya menyentuh job yang lock-nya basi (heartbeat lewat batas).
+	// Job milik instance lain yang masih hidup tidak disentuh.
 	recoverCtx, cancelRecover := context.WithTimeout(ctx, 10*time.Second)
-	recovered, err := migRepo.RecoverStuck(recoverCtx)
 	if recoveredJobs, recErr := jobCoordinator.RecoverOnStartup(recoverCtx, 15*time.Second); recErr != nil {
 		log.Printf("Peringatan: gagal memulihkan migration_jobs/locks saat startup: %v", recErr)
 	} else if recoveredJobs > 0 {
 		log.Printf("Berhasil memulihkan %d migration_jobs tertinggal saat startup", recoveredJobs)
 	}
 	cancelRecover()
-	if err != nil {
-		log.Printf("Peringatan: gagal memulihkan migration yang tertinggal: %v", err)
-	} else if recovered > 0 {
-		log.Printf("Berhasil menandai %d migration tertinggal (running) sebagai failed", recovered)
-	}
 
 	workerCtx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
-	_ = jobCoordinator.StartWorkers(workerCtx, 3)
+	workers := jobCoordinator.StartWorkers(workerCtx, 3)
 
-	csrfTokenFunc := func(r *http.Request) string {
-		return auth.CSRFToken(r)
-	}
-
-	httpdbHandler, err := httpdb.NewHandler(viewerService, migService, authorizer, csrfTokenFunc)
+	httpdbHandler, err := httpdb.NewHandler(viewerService, migService, authorizer, auth.CSRFToken)
 	if err != nil {
 		log.Fatalf("Gagal inisialisasi httpdb handler: %v", err)
 	}
 	jobAPIHandler := httpdb.NewJobAPIHandler(jobCoordinator)
+	approvalHandler := accesscontrol.NewApprovalHandler(
+		accesscontrol.NewApprovalService(accesscontrol.NewPostgresApprovalStore(db), authorizer),
+	)
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/login", authHandler.LoginHandler)
-	mux.HandleFunc("/logout", authHandler.LogoutHandler)
+	// Auth (JSON). Login tidak butuh sesi; logout/me memvalidasi sesi sendiri.
+	mux.HandleFunc("POST /api/auth/login", authHandler.LoginHandler)
+	mux.Handle("POST /api/auth/logout", authHandler.AuthMiddleware(auth.CSRFMiddleware(http.HandlerFunc(authHandler.LogoutHandler))))
+	mux.Handle("GET /api/auth/me", authHandler.AuthMiddleware(http.HandlerFunc(authHandler.MeHandler)))
 
-	dashboardHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		session, ok := r.Context().Value(auth.SessionContextKey).(*auth.Session)
-		if !ok || session == nil {
-			http.Redirect(w, r, "/", http.StatusSeeOther)
-			return
-		}
-
-		dbs, err := authorizer.AccessibleDatabases(r.Context(), int64(session.UserID))
-		if err != nil {
-			log.Printf("Gagal mengambil database yang dapat diakses: %v", err)
-			dbs = nil
-		}
-
-		isAdmin := false
-		if err := accessService.RequirePlatformAdmin(session.UserID); err == nil {
-			isAdmin = true
-		}
-
-		tmplPath := findTemplatePath("dashboard.html")
-		tmpl, err := template.ParseFiles(tmplPath)
-		if err != nil {
-			log.Printf("Gagal parse dashboard template (%s): %v", tmplPath, err)
-			http.Error(w, "Gagal merender template", http.StatusInternalServerError)
-			return
-		}
-
-		data := struct {
-			UserID    int
-			IsAdmin   bool
-			Databases []ports.DatabaseAccess
-			CSRFToken string
-		}{
-			UserID:    session.UserID,
-			IsAdmin:   isAdmin,
-			Databases: dbs,
-			CSRFToken: auth.CSRFToken(r),
-		}
-
-		if err := tmpl.Execute(w, data); err != nil {
-			log.Printf("Gagal eksekusi dashboard template: %v", err)
-			http.Error(w, "Gagal merender template", http.StatusInternalServerError)
-		}
-	})
-	mux.Handle("/dashboard", authHandler.AuthMiddleware(dashboardHandler))
-
-	adminGet := func(next http.HandlerFunc) http.Handler {
-		return authHandler.AuthMiddleware(http.HandlerFunc(accesscontrol.RequireAdmin(accessService, next)))
-	}
-	adminPost := func(next http.HandlerFunc) http.Handler {
+	// Admin: wajib login + CSRF (state-changing) + platform admin.
+	adminProtect := func(next http.HandlerFunc) http.Handler {
 		return authHandler.AuthMiddleware(auth.CSRFMiddleware(http.HandlerFunc(accesscontrol.RequireAdmin(accessService, next))))
 	}
+	adminHandler.Register(mux, adminProtect)
 
-	mux.Handle("/admin", adminGet(adminHandler.AdminDashboard))
-	mux.Handle("/admin/users", adminPost(adminHandler.CreateUser))
-	mux.Handle("/admin/users/status", adminPost(adminHandler.SetUserStatus))
-	mux.Handle("/admin/groups", adminPost(adminHandler.CreateGroup))
-	mux.Handle("/admin/users/groups", adminPost(adminHandler.AddUserToGroup))
-	mux.Handle("/admin/users/groups/remove", adminPost(adminHandler.RemoveUserFromGroup))
-	mux.Handle("/admin/groups/access", adminPost(adminHandler.SetGroupAccess))
-	mux.Handle("/admin/databases", adminPost(adminHandler.CreateDatabaseConnection))
-	mux.Handle("/admin/databases/delete", adminPost(adminHandler.DeleteDatabaseConnection))
-
+	// Viewer, history, migration/job, dan approval: login + CSRF + user ID di context.
 	protectDB := func(next http.Handler) http.Handler {
 		return authHandler.AuthMiddleware(auth.CSRFMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			userID, ok := auth.UserIDFromContext(r.Context())
 			if !ok || userID <= 0 {
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				auth.WriteError(w, http.StatusUnauthorized, "Unauthorized")
 				return
 			}
 			next.ServeHTTP(w, httpdb.WithUserID(r, userID))
@@ -281,33 +231,46 @@ func main() {
 	}
 	httpdbHandler.Register(mux, protectDB)
 	jobAPIHandler.RegisterRoutes(mux, protectDB)
+	approvalHandler.Register(mux, protectDB)
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
+	mux.Handle("GET /metrics", metrics.Handler())
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		hc, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := pgxPool.Ping(hc); err != nil {
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 			return
 		}
-
-		tmplPath := findTemplatePath("login.html")
-		tmpl, err := template.ParseFiles(tmplPath)
-		if err != nil {
-			log.Printf("Gagal parse login template (%s): %v", tmplPath, err)
-			http.Error(w, "Gagal merender tampilan", http.StatusInternalServerError)
-			return
-		}
-
-		if err := tmpl.Execute(w, nil); err != nil {
-			log.Printf("Gagal eksekusi login template: %v", err)
-			http.Error(w, "Gagal merender tampilan", http.StatusInternalServerError)
-		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
 	})
+
+	handler := http.Handler(mux)
+	handler = auth.CORS(os.Getenv("FRONTEND_ORIGIN"))(handler)
+	handler = telemetry.Middleware(metrics)(handler)
 
 	listenAddr := os.Getenv("LISTEN_ADDR")
 	if listenAddr == "" {
 		listenAddr = ":8080"
 	}
-	fmt.Printf("Server berjalan di http://localhost%s...\n", listenAddr)
-	if err := http.ListenAndServe(listenAddr, mux); err != nil {
+	srv := &http.Server{Addr: listenAddr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+
+	sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-sigCtx.Done()
+		slog.Info("shutdown dimulai")
+		shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+
+	slog.Info("server berjalan", "addr", listenAddr)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+
+	cancelWorkers()
+	workers.Wait()
+	_ = shutdownTracing(context.Background())
 }

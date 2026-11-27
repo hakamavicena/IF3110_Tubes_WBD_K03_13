@@ -303,6 +303,34 @@ func (r *PGRepository) FinalizeJobExecution(
 		newActiveState = string(ActiveStatePartiallyReverted)
 	}
 
+	// Spec v4: attempt yang gagal (transaction di-rollback, tidak ada perubahan yang
+	// ter-commit) tetap dicatat di migration_history dengan status 'failed'. Attempt
+	// gagal tidak mengubah active_state maupun active_execution_id.
+	shouldRecordFailure := finalStatus == StatusFailed && job.Action != JobActionCancelBatch
+	if shouldRecordFailure {
+		historyAction := string(job.Action)
+		if job.Action == JobActionRetryBatch {
+			historyAction = string(JobActionApply)
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO migration_history (
+				database_id, migration_id, job_id, version, revision, title,
+				action, sql_executed, executed_by, executed_at, duration_ms,
+				rows_affected, status, reverted_execution_id
+			) VALUES (
+				$1, $2, $3, $4, $5, $6,
+				$7, $8, $9, now(), $10,
+				$11, 'failed', NULL
+			)`,
+			job.DatabaseID, job.MigrationID, job.ID, migVersion, migRevision, migTitle,
+			historyAction, job.SQLSnapshot, job.RequestedBy, durationMs,
+			progress.CommittedRows,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
 	shouldRecordHistory := finalStatus == StatusSuccess && job.Action != JobActionCancelBatch
 
 	var newExecutionID *int64
@@ -629,6 +657,162 @@ func (r *PGRepository) UpdateDraftWithJob(ctx context.Context, databaseID, migra
 			databaseID, migrationID, in.SQL, string(mode), batchCol, batchSizePtr, userID,
 		).Scan(&jobID)
 	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	mig, err := r.GetM2(ctx, migrationID)
+	if err != nil {
+		return nil, nil, err
+	}
+	job, err := r.GetJob(ctx, databaseID, jobID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return mig, job, nil
+}
+
+// CreateRollbackForwardJob membuat job rollback atau forward berstatus 'draft'.
+//
+// Job ini TIDAK dieksekusi di sini. Ia harus melewati alur
+// draft -> pending_review -> approved (leader semua group) -> enqueue -> worker,
+// sama seperti job apply. Aturan linear divalidasi di dalam transaksi yang
+// dikunci per database:
+//
+//   - rollback: hanya migration aktif terakhir (applied, tanpa versi lebih
+//     tinggi yang masih applied), bukan irreversible, memakai sql_down asli, dan
+//     mencatat reverts_execution_id = eksekusi aktif yang dibatalkan.
+//   - forward: hanya migration pertama (versi terendah) yang berstatus
+//     rolled_back, memakai sql (Up) asli, dan tidak menjalankan versi di atasnya.
+//
+// Pengajuan ditolak jika migration yang sama masih memiliki job non-terminal,
+// agar tidak ada dua pengajuan paralel untuk satu migration.
+func (r *PGRepository) CreateRollbackForwardJob(
+	ctx context.Context,
+	databaseID, migrationID, userID int64,
+	action JobAction,
+) (*Migration, *Job, error) {
+	if action != JobActionRollback && action != JobActionForward {
+		return nil, nil, fmt.Errorf("%w: aksi harus rollback atau forward", apperr.ErrInvalidInput)
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", databaseID); err != nil {
+		return nil, nil, err
+	}
+
+	var (
+		version        int
+		sqlUp          string
+		sqlDown        string
+		isIrreversible bool
+		execMode       string
+		batchCol       string
+		batchSize      int
+		activeState    string
+		status         string
+		activeExecID   *int64
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT version, sql, COALESCE(sql_down, ''), is_irreversible, execution_mode,
+		       COALESCE(batch_column, ''), COALESCE(batch_size, 0),
+		       active_state, status, active_execution_id
+		FROM migrations
+		WHERE id = $1 AND database_id = $2
+		FOR UPDATE`,
+		migrationID, databaseID,
+	).Scan(&version, &sqlUp, &sqlDown, &isIrreversible, &execMode,
+		&batchCol, &batchSize, &activeState, &status, &activeExecID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, apperr.ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var pending bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM migration_jobs
+			WHERE database_id = $1 AND migration_id = $2
+			  AND status IN ('draft', 'pending_review', 'approved', 'pending_queue', 'running')
+		)`, databaseID, migrationID).Scan(&pending); err != nil {
+		return nil, nil, err
+	}
+	if pending {
+		return nil, nil, fmt.Errorf("%w: migration ini masih memiliki pengajuan yang belum selesai", apperr.ErrNotExecutable)
+	}
+
+	var snapshot string
+	var revertsExecID *int64
+	switch action {
+	case JobActionRollback:
+		if ActiveState(activeState) != ActiveStateApplied || Status(status) != StatusSuccess || activeExecID == nil {
+			return nil, nil, fmt.Errorf("%w: hanya migration yang sedang applied yang dapat di-rollback", apperr.ErrNotExecutable)
+		}
+		if isIrreversible {
+			return nil, nil, fmt.Errorf("%w: migration irreversible tidak dapat di-rollback", apperr.ErrInvalidInput)
+		}
+		if strings.TrimSpace(sqlDown) == "" {
+			return nil, nil, fmt.Errorf("%w: migration tidak memiliki sql_down", apperr.ErrInvalidInput)
+		}
+		var laterApplied bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM migrations
+				WHERE database_id = $1 AND version > $2
+				  AND active_state IN ('applied', 'partial', 'partially_reverted')
+			)`, databaseID, version).Scan(&laterApplied); err != nil {
+			return nil, nil, err
+		}
+		if laterApplied {
+			return nil, nil, fmt.Errorf("%w: rollback harus dimulai dari migration aktif terakhir", apperr.ErrNotExecutable)
+		}
+		snapshot = sqlDown
+		revertsExecID = activeExecID
+	case JobActionForward:
+		if ActiveState(activeState) != ActiveStateRolledBack || Status(status) != StatusSuccess {
+			return nil, nil, fmt.Errorf("%w: hanya migration yang sudah di-rollback yang dapat di-forward", apperr.ErrNotExecutable)
+		}
+		var earlierRolledBack bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM migrations
+				WHERE database_id = $1 AND version < $2 AND active_state = 'rolled_back'
+			)`, databaseID, version).Scan(&earlierRolledBack); err != nil {
+			return nil, nil, err
+		}
+		if earlierRolledBack {
+			return nil, nil, fmt.Errorf("%w: forward harus dimulai dari migration rolled_back paling awal", apperr.ErrNotExecutable)
+		}
+		snapshot = sqlUp
+	}
+
+	var batchColArg any
+	var batchSizeArg any
+	if ExecutionMode(execMode) == ExecutionModeBatch {
+		batchColArg, batchSizeArg = batchCol, batchSize
+	}
+
+	var jobID int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO migration_jobs (
+			database_id, migration_id, action, status, reverts_execution_id,
+			sql_snapshot, execution_mode, batch_column, batch_size, requested_by
+		) VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9)
+		RETURNING id`,
+		databaseID, migrationID, string(action), revertsExecID,
+		snapshot, execMode, batchColArg, batchSizeArg, userID,
+	).Scan(&jobID)
 	if err != nil {
 		return nil, nil, err
 	}

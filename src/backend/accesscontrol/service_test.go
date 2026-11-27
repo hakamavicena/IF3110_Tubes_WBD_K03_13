@@ -520,3 +520,58 @@ func TestAuthorizer_AccessibleDatabases(t *testing.T) {
 		t.Errorf("db_beta access mismatch: %+v", dbs[1])
 	}
 }
+
+func (f *fakeAccessRepo) SetUserAdmin(userID int, isAdmin bool) error {
+	if f.failWith != nil {
+		return f.failWith
+	}
+	u, ok := f.users[userID]
+	if !ok {
+		return ErrNotFound
+	}
+	u.IsAdmin = isAdmin
+	return nil
+}
+
+func (f *fakeAccessRepo) IsGroupMember(userID, groupID int) (bool, error) {
+	if f.failWith != nil {
+		return false, f.failWith
+	}
+	for _, gid := range f.userGroups[userID] {
+		if gid == groupID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *fakeAccessRepo) SetGroupLeader(groupID, userID int) error {
+	if f.failWith != nil {
+		return f.failWith
+	}
+	g, ok := f.groups[groupID]
+	if !ok {
+		return ErrNotFound
+	}
+	u, ok := f.users[userID]
+	if !ok {
+		return ErrNotFound
+	}
+	id := userID
+	g.LeaderID = &id
+	g.LeaderUsername = u.Username
+	return nil
+}
+
+func (f *fakeAccessRepo) GetLeaderGroups(userID int) ([]Group, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	var res []Group
+	for _, g := range f.groups {
+		if g.LeaderID != nil && *g.LeaderID == userID {
+			res = append(res, *g)
+		}
+	}
+	return res, nil
+}
