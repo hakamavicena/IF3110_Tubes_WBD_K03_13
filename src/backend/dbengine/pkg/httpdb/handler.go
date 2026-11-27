@@ -2,554 +2,469 @@ package httpdb
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
-	"net/http/httptest"
-	"reflect"
-	"testing"
+	"strconv"
+	"strings"
 	"time"
 
+	"backend/dbengine/pkg/apperr"
 	"backend/dbengine/pkg/dbviewer"
 	"backend/dbengine/pkg/migration"
 	"backend/dbengine/pkg/ports"
 )
 
-type databaseListAuthorizer struct {
-	ports.DenyAll
-	databases []ports.DatabaseAccess
+type userIDContextKey struct{}
+
+func WithUserID(r *http.Request, userID int64) *http.Request {
+	return r.WithContext(withUserID(r, userID))
 }
 
-func (a databaseListAuthorizer) AccessibleDatabases(
-	_ context.Context,
-	_ int64,
-) ([]ports.DatabaseAccess, error) {
-	return a.databases, nil
+func withUserID(r *http.Request, userID int64) context.Context {
+	return context.WithValue(r.Context(), userIDContextKey{}, userID)
 }
 
-func TestRegisterDoesNotExposeLegacyOrSynchronousRoutes(t *testing.T) {
-	_, mux := newTestHandler(t, ports.DenyAll{})
+func UserIDFromContext(ctx context.Context) (int64, bool) {
+	userID, ok := ctx.Value(userIDContextKey{}).(int64)
+	return userID, ok && userID > 0
+}
 
-	// Rute M1 (HTML) dan rute sinkron yang melewati approval/queue tidak boleh ada.
-	for _, tc := range []struct{ method, path string }{
-		{http.MethodGet, "/databases"},
-		{http.MethodPost, "/databases/1/migrations/1/execute"},
-		{http.MethodPost, "/databases/1/migrations"},
-	} {
-		recorder := httptest.NewRecorder()
-		mux.ServeHTTP(recorder, httptest.NewRequest(tc.method, tc.path, nil))
-		if recorder.Code != http.StatusNotFound && recorder.Code != http.StatusMethodNotAllowed {
-			t.Fatalf("%s %s status = %d, want 404/405", tc.method, tc.path, recorder.Code)
+type Handler struct {
+	viewer     *dbviewer.Service
+	migrations *migration.Service
+	authz      ports.Authorizer
+}
+
+func NewHandler(viewer *dbviewer.Service, migrations *migration.Service, authz ports.Authorizer, csrfToken func(*http.Request) string) (*Handler, error) {
+	if viewer == nil || migrations == nil || authz == nil || csrfToken == nil {
+		return nil, errors.New("httpdb dependencies must be configured")
+	}
+	return &Handler{viewer: viewer, migrations: migrations, authz: authz}, nil
+}
+
+func (h *Handler) Register(mux *http.ServeMux, protect func(http.Handler) http.Handler) {
+	if mux == nil || protect == nil {
+		panic("httpdb requires a mux and authentication/CSRF middleware")
+	}
+	route := func(pattern string, handler http.HandlerFunc) {
+		mux.Handle(pattern, protect(handler))
+	}
+	route("GET /api/databases", h.apiListDatabases)
+	route("GET /api/databases/{dbID}/schemas", h.apiListSchemas)
+	route("GET /api/databases/{dbID}/schemas/{schema}/tables", h.apiListTables)
+	route("GET /api/databases/{dbID}/schemas/{schema}/tables/{table}", h.apiTableDetail)
+	route("GET /api/databases/{dbID}/schemas/{schema}/tables/{table}/data", h.apiTableData)
+	route("GET /api/databases/{dbID}/history", h.apiMigrationHistory)
+}
+
+func pathID(r *http.Request, name string) (int64, error) {
+	id, err := strconv.ParseInt(r.PathValue(name), 10, 64)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("%w: id tidak valid", apperr.ErrInvalidInput)
+	}
+	return id, nil
+}
+
+func userMessage(err error) string {
+	_, message, ok := strings.Cut(err.Error(), ": ")
+	if ok && message != "" {
+		return message
+	}
+	return err.Error()
+}
+
+func (h *Handler) handleAPIError(w http.ResponseWriter, r *http.Request, err error) {
+	code, message := http.StatusInternalServerError, "internal server error"
+
+	switch {
+	case errors.Is(err, apperr.ErrForbidden):
+		code, message = http.StatusForbidden, "Anda tidak memiliki akses ke database ini."
+	case errors.Is(err, apperr.ErrNotFound):
+		code, message = http.StatusNotFound, "Data tidak ditemukan."
+	case errors.Is(err, apperr.ErrInvalidInput):
+		code, message = http.StatusBadRequest, userMessage(err)
+	case errors.Is(err, apperr.ErrNotExecutable):
+		code, message = http.StatusConflict, userMessage(err)
+	case errors.Is(err, apperr.ErrConnectionFailed):
+		code, message = http.StatusBadGateway, "Tidak dapat terhubung ke database target."
+	default:
+		slog.Error("unhandled database API error", "path", r.URL.Path, "err", err)
+	}
+
+	writeJSON(w, code, apiErrorResponse{Error: message})
+}
+
+type apiErrorResponse struct {
+	Error string `json:"error"`
+}
+
+type databaseAccessDTO struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Access string `json:"access"`
+}
+
+type databaseListResponse struct {
+	Databases []databaseAccessDTO `json:"databases"`
+}
+
+type schemaListResponse struct {
+	Schemas []string `json:"schemas"`
+}
+
+type tableInfoDTO struct {
+	Schema string `json:"schema"`
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+}
+
+type tableListResponse struct {
+	Tables []tableInfoDTO `json:"tables"`
+}
+
+type columnInfoDTO struct {
+	Position int     `json:"position"`
+	Name     string  `json:"name"`
+	DataType string  `json:"data_type"`
+	Nullable bool    `json:"nullable"`
+	Default  *string `json:"default"`
+}
+
+type constraintInfoDTO struct {
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Definition string `json:"definition"`
+}
+
+type indexInfoDTO struct {
+	Name       string `json:"name"`
+	Definition string `json:"definition"`
+	Unique     bool   `json:"unique"`
+}
+
+type tableDetailResponse struct {
+	Table       tableInfoDTO        `json:"table"`
+	Columns     []columnInfoDTO     `json:"columns"`
+	Constraints []constraintInfoDTO `json:"constraints"`
+	Indexes     []indexInfoDTO      `json:"indexes"`
+}
+
+type tableDataResponse struct {
+	Columns  []string    `json:"columns"`
+	Rows     [][]*string `json:"rows"`
+	Page     int         `json:"page"`
+	PageSize int         `json:"page_size"`
+	Total    int64       `json:"total"`
+	Pages    int         `json:"pages"`
+}
+
+type migrationExecutionDTO struct {
+	ExecutionID         int64                     `json:"execution_id"`
+	DatabaseID          int64                     `json:"database_id"`
+	MigrationID         int64                     `json:"migration_id"`
+	JobID               *int64                    `json:"job_id"`
+	Version             int                       `json:"version"`
+	Revision            int                       `json:"revision"`
+	Title               string                    `json:"title"`
+	Action              migration.ExecutionAction `json:"action"`
+	SQLExecuted         string                    `json:"sql_executed"`
+	ExecutedBy          int64                     `json:"executed_by"`
+	ExecutedByName      string                    `json:"executed_by_name"`
+	ExecutedAt          time.Time                 `json:"executed_at"`
+	DurationMs          int                       `json:"duration_ms"`
+	RowsAffected        int64                     `json:"rows_affected"`
+	Status              migration.Status          `json:"status"`
+	RevertedExecutionID *int64                    `json:"reverted_execution_id"`
+}
+
+type migrationHistoryResponse struct {
+	History []migrationExecutionDTO `json:"history"`
+}
+
+func (h *Handler) apiMigrationHistory(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	hideRollback := false
+	if value, present := r.URL.Query()["hide_rollback"]; present {
+		if len(value) != 1 {
+			h.handleAPIError(w, r, fmt.Errorf(
+				"%w: parameter hide_rollback tidak valid",
+				apperr.ErrInvalidInput,
+			))
+			return
+		}
+		hideRollback, err = strconv.ParseBool(value[0])
+		if err != nil {
+			h.handleAPIError(w, r, fmt.Errorf(
+				"%w: parameter hide_rollback tidak valid",
+				apperr.ErrInvalidInput,
+			))
+			return
 		}
 	}
-}
 
-func newTestHandler(t *testing.T, authz ports.Authorizer) (*Handler, *http.ServeMux) {
-	t.Helper()
-
-	viewer := dbviewer.NewService(authz, nil)
-	migrations := migration.NewService(nil, authz, nil, nil, time.Second)
-	handler, err := NewHandler(viewer, migrations, authz, func(*http.Request) string {
-		return "csrf"
-	})
+	executions, err := h.migrations.History(r.Context(), userID, dbID, hideRollback)
 	if err != nil {
-		t.Fatal(err)
+		h.handleAPIError(w, r, err)
+		return
 	}
 
-	mux := http.NewServeMux()
-	handler.Register(mux, func(next http.Handler) http.Handler {
-		return next
-	})
-	return handler, mux
-}
-
-func TestRegisterRejectsMissingUser(t *testing.T) {
-	_, mux := newTestHandler(t, ports.DenyAll{})
-
-	tests := []struct {
-		path        string
-		contentType string
-	}{
-		{path: "/api/databases", contentType: "application/json"},
-	}
-
-	for _, test := range tests {
-		t.Run(test.path, func(t *testing.T) {
-			recorder := httptest.NewRecorder()
-			request := httptest.NewRequest(http.MethodGet, test.path, nil)
-
-			mux.ServeHTTP(recorder, request)
-
-			if recorder.Code != http.StatusUnauthorized {
-				t.Fatalf("GET %s status = %d, want %d",
-					test.path, recorder.Code, http.StatusUnauthorized)
-			}
-			if test.contentType != "" &&
-				recorder.Header().Get("Content-Type") != test.contentType {
-				t.Fatalf("Content-Type = %q, want %q",
-					recorder.Header().Get("Content-Type"), test.contentType)
-			}
+	history := make([]migrationExecutionDTO, 0, len(executions))
+	for _, execution := range executions {
+		history = append(history, migrationExecutionDTO{
+			ExecutionID:         execution.ExecutionID,
+			DatabaseID:          execution.DatabaseID,
+			MigrationID:         execution.MigrationID,
+			JobID:               execution.JobID,
+			Version:             execution.Version,
+			Revision:            execution.Revision,
+			Title:               execution.Title,
+			Action:              execution.Action,
+			SQLExecuted:         execution.SQLExecuted,
+			ExecutedBy:          execution.ExecutedBy,
+			ExecutedByName:      execution.ExecutedByName,
+			ExecutedAt:          execution.ExecutedAt,
+			DurationMs:          execution.DurationMs,
+			RowsAffected:        execution.RowsAffected,
+			Status:              execution.Status,
+			RevertedExecutionID: execution.RevertedExecutionID,
 		})
 	}
+	writeJSON(w, http.StatusOK, migrationHistoryResponse{History: history})
 }
 
-func TestAPIListDatabasesReturnsAccessLevels(t *testing.T) {
-	authz := databaseListAuthorizer{
-		databases: []ports.DatabaseAccess{
-			{DatabaseID: 1, Name: "view_db", Level: ports.LevelView},
-			{DatabaseID: 2, Name: "edit_db", Level: ports.LevelEdit},
-		},
-	}
-	_, mux := newTestHandler(t, authz)
-
-	request := httptest.NewRequest(http.MethodGet, "/api/databases", nil)
-	request = WithUserID(request, 42)
-	recorder := httptest.NewRecorder()
-
-	mux.ServeHTTP(recorder, request)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("GET /api/databases status = %d, want %d",
-			recorder.Code, http.StatusOK)
-	}
-	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
-		t.Fatalf("Content-Type = %q, want %q", got, "application/json")
+func (h *Handler) apiListDatabases(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
 	}
 
-	var got databaseListResponse
-	if err := json.Unmarshal(recorder.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode response JSON: %v", err)
-	}
-
-	want := []databaseAccessDTO{
-		{ID: 1, Name: "view_db", Access: "view"},
-		{ID: 2, Name: "edit_db", Access: "edit"},
-	}
-	if !reflect.DeepEqual(got.Databases, want) {
-		t.Fatalf("databases = %+v, want %+v", got.Databases, want)
-	}
-}
-
-func TestAPIListSchemasValidatesIDAndAccess(t *testing.T) {
-	_, mux := newTestHandler(t, ports.DenyAll{})
-
-	tests := []struct {
-		name       string
-		path       string
-		wantStatus int
-	}{
-		{
-			name:       "invalid database ID",
-			path:       "/api/databases/not-an-id/schemas",
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "user without database access",
-			path:       "/api/databases/1/schemas",
-			wantStatus: http.StatusForbidden,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodGet, test.path, nil)
-			request = WithUserID(request, 42)
-			recorder := httptest.NewRecorder()
-
-			mux.ServeHTTP(recorder, request)
-
-			if recorder.Code != test.wantStatus {
-				t.Fatalf("GET %s status = %d, want %d",
-					test.path, recorder.Code, test.wantStatus)
-			}
-			if got := recorder.Header().Get("Content-Type"); got != "application/json" {
-				t.Fatalf("Content-Type = %q, want %q", got, "application/json")
-			}
-
-			var response apiErrorResponse
-			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
-				t.Fatalf("decode response JSON: %v", err)
-			}
-			if response.Error == "" {
-				t.Fatal("expected a JSON error message")
-			}
-		})
-	}
-}
-
-func TestAPIListTablesValidatesIDAndAccess(t *testing.T) {
-	_, mux := newTestHandler(t, ports.DenyAll{})
-
-	tests := []struct {
-		name       string
-		path       string
-		wantStatus int
-	}{
-		{
-			name:       "invalid database ID",
-			path:       "/api/databases/not-an-id/schemas/public/tables",
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "user without database access",
-			path:       "/api/databases/1/schemas/public/tables",
-			wantStatus: http.StatusForbidden,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodGet, test.path, nil)
-			request = WithUserID(request, 42)
-			recorder := httptest.NewRecorder()
-
-			mux.ServeHTTP(recorder, request)
-
-			if recorder.Code != test.wantStatus {
-				t.Fatalf("GET %s status = %d, want %d",
-					test.path, recorder.Code, test.wantStatus)
-			}
-			if got := recorder.Header().Get("Content-Type"); got != "application/json" {
-				t.Fatalf("Content-Type = %q, want %q", got, "application/json")
-			}
-
-			var response apiErrorResponse
-			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
-				t.Fatalf("decode response JSON: %v", err)
-			}
-			if response.Error == "" {
-				t.Fatal("expected a JSON error message")
-			}
-		})
-	}
-}
-
-func TestAPITableDetailValidatesIDAndAccess(t *testing.T) {
-	_, mux := newTestHandler(t, ports.DenyAll{})
-
-	tests := []struct {
-		name       string
-		path       string
-		wantStatus int
-	}{
-		{
-			name:       "invalid database ID",
-			path:       "/api/databases/not-an-id/schemas/public/tables/orders",
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "user without database access",
-			path:       "/api/databases/1/schemas/public/tables/orders",
-			wantStatus: http.StatusForbidden,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodGet, test.path, nil)
-			request = WithUserID(request, 42)
-			recorder := httptest.NewRecorder()
-
-			mux.ServeHTTP(recorder, request)
-
-			if recorder.Code != test.wantStatus {
-				t.Fatalf("GET %s status = %d, want %d",
-					test.path, recorder.Code, test.wantStatus)
-			}
-			if got := recorder.Header().Get("Content-Type"); got != "application/json" {
-				t.Fatalf("Content-Type = %q, want %q", got, "application/json")
-			}
-
-			var response apiErrorResponse
-			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
-				t.Fatalf("decode response JSON: %v", err)
-			}
-			if response.Error == "" {
-				t.Fatal("expected a JSON error message")
-			}
-		})
-	}
-}
-
-func TestAPITableDataValidatesPaginationAndAccess(t *testing.T) {
-	_, mux := newTestHandler(t, ports.DenyAll{})
-
-	tests := []struct {
-		name       string
-		path       string
-		wantStatus int
-	}{
-		{
-			name:       "invalid database ID",
-			path:       "/api/databases/not-an-id/schemas/public/tables/orders/data",
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "invalid page",
-			path:       "/api/databases/1/schemas/public/tables/orders/data?page=0",
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "invalid page size",
-			path:       "/api/databases/1/schemas/public/tables/orders/data?size=abc",
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "user without database access",
-			path:       "/api/databases/1/schemas/public/tables/orders/data?page=1&size=25",
-			wantStatus: http.StatusForbidden,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodGet, test.path, nil)
-			request = WithUserID(request, 42)
-			recorder := httptest.NewRecorder()
-
-			mux.ServeHTTP(recorder, request)
-
-			if recorder.Code != test.wantStatus {
-				t.Fatalf("GET %s status = %d, want %d",
-					test.path, recorder.Code, test.wantStatus)
-			}
-			if got := recorder.Header().Get("Content-Type"); got != "application/json" {
-				t.Fatalf("Content-Type = %q, want %q", got, "application/json")
-			}
-
-			var response apiErrorResponse
-			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
-				t.Fatalf("decode response JSON: %v", err)
-			}
-			if response.Error == "" {
-				t.Fatal("expected a JSON error message")
-			}
-		})
-	}
-}
-
-type migrationHistoryTestAuthorizer struct {
-	ports.DenyAll
-	canView bool
-}
-
-func (a migrationHistoryTestAuthorizer) CanView(
-	context.Context,
-	int64,
-	int64,
-) (bool, error) {
-	return a.canView, nil
-}
-
-type migrationHistoryTestRepository struct {
-	migration.Repository
-	executions    []migration.Execution
-	requestedDBID int64
-}
-
-func (r *migrationHistoryTestRepository) ListHistory(
-	_ context.Context,
-	databaseID int64,
-) ([]migration.Execution, error) {
-	r.requestedDBID = databaseID
-	return r.executions, nil
-}
-
-func newMigrationHistoryTestMux(
-	t *testing.T,
-	repo *migrationHistoryTestRepository,
-	authz ports.Authorizer,
-) *http.ServeMux {
-	t.Helper()
-
-	viewer := dbviewer.NewService(authz, nil)
-	migrations := migration.NewService(repo, authz, nil, nil, time.Second)
-	handler, err := NewHandler(viewer, migrations, authz, func(*http.Request) string {
-		return "csrf"
-	})
+	databases, err := h.authz.AccessibleDatabases(r.Context(), userID)
 	if err != nil {
-		t.Fatal(err)
+		slog.Error("list accessible databases failed", "user_id", userID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, apiErrorResponse{Error: "internal server error"})
+		return
 	}
 
-	mux := http.NewServeMux()
-	handler.Register(mux, func(next http.Handler) http.Handler {
-		return next
-	})
-	return mux
+	items := make([]databaseAccessDTO, 0, len(databases))
+	for _, database := range databases {
+		var access string
+		switch database.Level {
+		case ports.LevelView:
+			access = "view"
+		case ports.LevelEdit:
+			access = "edit"
+		default:
+			slog.Error(
+				"unexpected database access level",
+				"database_id", database.DatabaseID,
+				"level", database.Level,
+			)
+			writeJSON(w, http.StatusInternalServerError, apiErrorResponse{Error: "internal server error"})
+			return
+		}
+
+		items = append(items, databaseAccessDTO{
+			ID:     database.DatabaseID,
+			Name:   database.Name,
+			Access: access,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, databaseListResponse{Databases: items})
 }
 
-func TestAPIListMigrationHistoryAndHideRollback(t *testing.T) {
-	revertedID := int64(2)
-	repo := &migrationHistoryTestRepository{
-		executions: []migration.Execution{
-			{
-				ExecutionID: 1, DatabaseID: 10, MigrationID: 4,
-				Version: 1, Revision: 1, Title: "first",
-				Action: migration.ActionApply, SQLExecuted: "CREATE TABLE firsts(id int)",
-				ExecutedBy: 7, ExecutedByName: "alice",
-				Status: migration.StatusSuccess,
-			},
-			{
-				ExecutionID: 2, DatabaseID: 10, MigrationID: 5,
-				Version: 2, Revision: 1, Title: "second",
-				Action: migration.ActionApply, SQLExecuted: "CREATE TABLE seconds(id int)",
-				ExecutedBy: 7, ExecutedByName: "alice",
-				Status: migration.StatusSuccess,
-			},
-			{
-				ExecutionID: 3, DatabaseID: 10, MigrationID: 5,
-				Version: 2, Revision: 1, Title: "second",
-				Action: migration.ActionRollback, SQLExecuted: "DROP TABLE seconds",
-				ExecutedBy: 7, ExecutedByName: "alice",
-				Status: migration.StatusSuccess, RevertedExecutionID: &revertedID,
-			},
-			{
-				ExecutionID: 4, DatabaseID: 10, MigrationID: 5,
-				Version: 2, Revision: 1, Title: "second",
-				Action: migration.ActionForward, SQLExecuted: "CREATE TABLE seconds(id int)",
-				ExecutedBy: 7, ExecutedByName: "alice",
-				Status: migration.StatusSuccess, RevertedExecutionID: ptrHistoryInt64(3),
-			},
-			{
-				ExecutionID: 5, DatabaseID: 10, MigrationID: 6,
-				Version: 3, Revision: 1, Title: "third",
-				Action: migration.ActionApply, SQLExecuted: "invalid SQL",
-				ExecutedBy: 7, ExecutedByName: "alice",
-				Status: migration.StatusFailed,
-			},
-		},
+func (h *Handler) apiListSchemas(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
 	}
-	mux := newMigrationHistoryTestMux(
-		t,
-		repo,
-		migrationHistoryTestAuthorizer{canView: true},
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	schemas, err := h.viewer.ListSchemas(r.Context(), userID, dbID)
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+	if schemas == nil {
+		schemas = []string{}
+	}
+
+	writeJSON(w, http.StatusOK, schemaListResponse{Schemas: schemas})
+}
+
+func (h *Handler) apiListTables(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	schema := r.PathValue("schema")
+	tables, err := h.viewer.ListTables(r.Context(), userID, dbID, schema)
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	items := make([]tableInfoDTO, 0, len(tables))
+	for _, table := range tables {
+		items = append(items, tableInfoDTO{
+			Schema: table.Schema,
+			Name:   table.Name,
+			Type:   table.Type,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, tableListResponse{Tables: items})
+}
+
+func (h *Handler) apiTableDetail(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	detail, err := h.viewer.GetTableDetail(
+		r.Context(),
+		userID,
+		dbID,
+		r.PathValue("schema"),
+		r.PathValue("table"),
 	)
-
-	tests := []struct {
-		name    string
-		query   string
-		wantIDs []int64
-	}{
-		{name: "all executions", wantIDs: []int64{1, 2, 3, 4, 5}},
-		{name: "hide successful rollback pair", query: "?hide_rollback=true", wantIDs: []int64{1, 4, 5}},
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			request := httptest.NewRequest(
-				http.MethodGet,
-				"/api/databases/10/history"+test.query,
-				nil,
-			)
-			request = WithUserID(request, 42)
-			recorder := httptest.NewRecorder()
 
-			mux.ServeHTTP(recorder, request)
+	response := tableDetailResponse{
+		Table: tableInfoDTO{
+			Schema: detail.Table.Schema,
+			Name:   detail.Table.Name,
+			Type:   detail.Table.Type,
+		},
+		Columns:     make([]columnInfoDTO, 0, len(detail.Columns)),
+		Constraints: make([]constraintInfoDTO, 0, len(detail.Constraints)),
+		Indexes:     make([]indexInfoDTO, 0, len(detail.Indexes)),
+	}
 
-			if recorder.Code != http.StatusOK {
-				t.Fatalf("GET migration history status = %d, want %d; body: %s",
-					recorder.Code, http.StatusOK, recorder.Body.String())
-			}
-			if got := recorder.Header().Get("Content-Type"); got != "application/json" {
-				t.Fatalf("Content-Type = %q, want application/json", got)
-			}
-			var response migrationHistoryResponse
-			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
-				t.Fatalf("decode history response: %v", err)
-			}
-			if len(response.History) != len(test.wantIDs) {
-				t.Fatalf("history has %d rows, want %d: %+v",
-					len(response.History), len(test.wantIDs), response.History)
-			}
-			for i, wantID := range test.wantIDs {
-				if response.History[i].ExecutionID != wantID {
-					t.Errorf("history[%d].execution_id = %d, want %d",
-						i, response.History[i].ExecutionID, wantID)
-				}
-			}
-			if len(response.History) > 0 &&
-				(response.History[0].SQLExecuted == "" ||
-					response.History[0].ExecutedByName != "alice") {
-				t.Errorf("history is missing SQL snapshot or actor: %+v", response.History[0])
-			}
+	for _, column := range detail.Columns {
+		response.Columns = append(response.Columns, columnInfoDTO{
+			Position: column.Position,
+			Name:     column.Name,
+			DataType: column.DataType,
+			Nullable: column.Nullable,
+			Default:  column.Default,
 		})
 	}
-	if repo.requestedDBID != 10 {
-		t.Errorf("repository database ID = %d, want 10", repo.requestedDBID)
-	}
-}
-
-func TestAPIListMigrationHistoryRejectsInvalidRequests(t *testing.T) {
-	tests := []struct {
-		name       string
-		path       string
-		withUser   bool
-		canView    bool
-		wantStatus int
-	}{
-		{
-			name:       "missing user",
-			path:       "/api/databases/10/history",
-			wantStatus: http.StatusUnauthorized,
-		},
-		{
-			name:       "invalid database ID",
-			path:       "/api/databases/not-an-id/history",
-			withUser:   true,
-			canView:    true,
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "invalid hide rollback value",
-			path:       "/api/databases/10/history?hide_rollback=maybe",
-			withUser:   true,
-			canView:    true,
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "duplicate hide rollback values",
-			path:       "/api/databases/10/history?hide_rollback=true&hide_rollback=false",
-			withUser:   true,
-			canView:    true,
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "user lacks view access",
-			path:       "/api/databases/10/history",
-			withUser:   true,
-			wantStatus: http.StatusForbidden,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			repo := &migrationHistoryTestRepository{}
-			mux := newMigrationHistoryTestMux(
-				t,
-				repo,
-				migrationHistoryTestAuthorizer{canView: test.canView},
-			)
-			request := httptest.NewRequest(http.MethodGet, test.path, nil)
-			if test.withUser {
-				request = WithUserID(request, 42)
-			}
-			recorder := httptest.NewRecorder()
-
-			mux.ServeHTTP(recorder, request)
-
-			if recorder.Code != test.wantStatus {
-				t.Fatalf("GET %s status = %d, want %d; body: %s",
-					test.path, recorder.Code, test.wantStatus, recorder.Body.String())
-			}
-			var response apiErrorResponse
-			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
-				t.Fatalf("decode error response: %v", err)
-			}
-			if response.Error == "" {
-				t.Fatal("expected a JSON error message")
-			}
+	for _, constraint := range detail.Constraints {
+		response.Constraints = append(response.Constraints, constraintInfoDTO{
+			Name:       constraint.Name,
+			Type:       constraint.Type,
+			Definition: constraint.Definition,
 		})
 	}
+	for _, index := range detail.Indexes {
+		response.Indexes = append(response.Indexes, indexInfoDTO{
+			Name:       index.Name,
+			Definition: index.Definition,
+			Unique:     index.Unique,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
-func ptrHistoryInt64(value int64) *int64 {
-	return &value
+func (h *Handler) apiTableData(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiErrorResponse{Error: "unauthorized"})
+		return
+	}
+
+	dbID, err := pathID(r, "dbID")
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	page := 1
+	if value := r.URL.Query().Get("page"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			h.handleAPIError(w, r, fmt.Errorf("%w: halaman tidak valid", apperr.ErrInvalidInput))
+			return
+		}
+		page = parsed
+	}
+
+	size := 0
+	if value := r.URL.Query().Get("size"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			h.handleAPIError(w, r, fmt.Errorf("%w: ukuran halaman tidak valid", apperr.ErrInvalidInput))
+			return
+		}
+		size = parsed
+	}
+
+	data, err := h.viewer.GetTableData(
+		r.Context(),
+		userID,
+		dbID,
+		r.PathValue("schema"),
+		r.PathValue("table"),
+		page,
+		size,
+	)
+	if err != nil {
+		h.handleAPIError(w, r, err)
+		return
+	}
+
+	rows := data.Rows
+	if rows == nil {
+		rows = [][]*string{}
+	}
+
+	writeJSON(w, http.StatusOK, tableDataResponse{
+		Columns:  data.Columns,
+		Rows:     rows,
+		Page:     data.Page,
+		PageSize: data.PageSize,
+		Total:    data.Total,
+		Pages:    data.Pages,
+	})
 }
