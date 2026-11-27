@@ -8,6 +8,8 @@ import {
   fetchMigrationDetail,
   MigrationItem,
   MigrationJob,
+  requestForwardMigration,
+  requestRollbackMigration,
 } from "../api";
 import JobProgressMonitor, {
   statusBadgeClass,
@@ -24,6 +26,8 @@ export default function MigrationDetailPage() {
   const [activeLock, setActiveLock] = useState<DatabaseLockInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [actionErr, setActionErr] = useState<string | null>(null);
 
   const loadDetail = useCallback(async () => {
     if (!dbId || !migId) return;
@@ -52,13 +56,36 @@ export default function MigrationDetailPage() {
   const latestJob = jobs.length > 0 ? jobs[0] : null;
 
   const handleJobUpdated = useCallback((updatedJob: MigrationJob) => {
-    setJobs((prev) =>
-      prev.map((j) => (j.id === updatedJob.id ? updatedJob : j))
-    );
+    setJobs((prev) => {
+      const exists = prev.some((j) => j.id === updatedJob.id);
+      if (!exists) {
+        return [updatedJob, ...prev];
+      }
+      return prev.map((j) => (j.id === updatedJob.id ? updatedJob : j));
+    });
     setMigration((prev) =>
       prev ? { ...prev, status: updatedJob.status } : prev
     );
   }, []);
+
+  const handleRequestRollbackOrForward = async (kind: "rollback" | "forward") => {
+    setActionErr(null);
+    setActionBusy(kind);
+    try {
+      const res =
+        kind === "rollback"
+          ? await requestRollbackMigration(dbId, migId)
+          : await requestForwardMigration(dbId, migId);
+      setMigration(res.migration);
+      handleJobUpdated(res.job);
+    } catch (err) {
+      setActionErr(
+        err instanceof Error ? err.message : `Gagal mengajukan ${kind}`
+      );
+    } finally {
+      setActionBusy(null);
+    }
+  };
 
   if (loading) {
     return (
@@ -120,15 +147,50 @@ export default function MigrationDetailPage() {
           </p>
         </div>
 
-        {canEdit && !migration.is_immutable && (
-          <Link
-            href={`/databases/${dbId}/migrations/${migration.id}/edit`}
-            className="self-start rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 sm:self-auto"
-          >
-            Edit Draft Migration
-          </Link>
-        )}
+        <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+          {canEdit && !migration.is_immutable && (
+            <Link
+              href={`/databases/${dbId}/migrations/${migration.id}/edit`}
+              className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+            >
+              Edit Draft Migration
+            </Link>
+          )}
+          {canEdit &&
+            migration.active_state === "applied" &&
+            !migration.is_irreversible && (
+              <button
+                type="button"
+                disabled={actionBusy !== null}
+                onClick={() => void handleRequestRollbackOrForward("rollback")}
+                className="rounded-lg bg-rose-600 px-4 py-2 text-xs font-semibold text-white shadow-sm hover:bg-rose-700 disabled:opacity-50"
+              >
+                {actionBusy === "rollback" ? "Mengajukan..." : "Ajukan Rollback"}
+              </button>
+            )}
+          {canEdit &&
+            (migration.active_state === "rolled_back" ||
+              (migration.status === "failed" &&
+                (!latestJob || latestJob.status === "failed"))) && (
+              <button
+                type="button"
+                disabled={actionBusy !== null}
+                onClick={() => void handleRequestRollbackOrForward("forward")}
+                className="rounded-lg bg-cyan-700 px-4 py-2 text-xs font-semibold text-white shadow-sm hover:bg-cyan-800 disabled:opacity-50"
+              >
+                {actionBusy === "forward"
+                  ? "Mengajukan..."
+                  : "Ajukan Forward / Retry Attempt"}
+              </button>
+            )}
+        </div>
       </div>
+
+      {actionErr && (
+        <div className="rounded-xl border border-red-200 bg-red-50 p-3.5 text-xs text-red-700">
+          {actionErr}
+        </div>
+      )}
 
       {activeLock && (
         <div className="rounded-xl border border-amber-300 bg-amber-50 p-3.5 text-xs text-amber-900">

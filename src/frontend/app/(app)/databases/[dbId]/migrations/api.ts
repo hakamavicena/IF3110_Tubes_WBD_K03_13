@@ -218,3 +218,41 @@ export async function requestCancelBatch(
     method: "POST",
   });
 }
+
+export async function requestRollbackMigration(
+  dbId: string | number,
+  migId: string | number
+): Promise<{
+  job_id: number;
+  status: MigrationStatus;
+  job: MigrationJob;
+  migration: MigrationItem;
+}> {
+  return requestJSON<{
+    job_id: number;
+    status: MigrationStatus;
+    job: MigrationJob;
+    migration: MigrationItem;
+  }>(`/api/databases/${dbId}/migrations/${migId}/rollback`, {
+    method: "POST",
+  });
+}
+
+export async function requestForwardMigration(
+  dbId: string | number,
+  migId: string | number
+): Promise<{
+  job_id: number;
+  status: MigrationStatus;
+  job: MigrationJob;
+  migration: MigrationItem;
+}> {
+  return requestJSON<{
+    job_id: number;
+    status: MigrationStatus;
+    job: MigrationJob;
+    migration: MigrationItem;
+  }>(`/api/databases/${dbId}/migrations/${migId}/forward`, {
+    method: "POST",
+  });
+}

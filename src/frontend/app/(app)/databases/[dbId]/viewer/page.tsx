@@ -4,7 +4,9 @@ import { LoadingPanel } from "@/components/workspace-shell";
 
 export default function DatabaseViewerPage({
   params,
-}: PageProps<"/databases/[dbId]/viewer">) {
+}: {
+  params: Promise<{ dbId: string }>;
+}) {
   return (
     <Suspense fallback={<LoadingPanel label="Opening schema explorer…" />}>
       <DatabaseViewerContent params={params} />
