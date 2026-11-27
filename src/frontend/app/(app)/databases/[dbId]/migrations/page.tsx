@@ -45,6 +45,37 @@ export default function MigrationListPage() {
 
   return (
     <main className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8">
+      {dbId && (
+        <nav
+          aria-label="Navigasi database"
+          className="mb-6 flex gap-2 overflow-x-auto pb-1"
+        >
+          <Link
+            href="/dashboard"
+            className="inline-flex min-h-11 items-center rounded-xl px-3 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 hover:text-slate-950"
+          >
+            Databases
+          </Link>
+          <Link
+            href={`/databases/${encodeURIComponent(dbId)}/viewer`}
+            className="inline-flex min-h-11 items-center rounded-xl px-3 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 hover:text-slate-950"
+          >
+            Explorer
+          </Link>
+          <Link
+            href={`/databases/${encodeURIComponent(dbId)}/migrations`}
+            className="inline-flex min-h-11 items-center rounded-xl bg-slate-900 px-3 py-2 text-sm font-semibold text-white transition"
+          >
+            Migrations
+          </Link>
+          <Link
+            href={`/databases/${encodeURIComponent(dbId)}/history`}
+            className="inline-flex min-h-11 items-center rounded-xl px-3 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 hover:text-slate-950"
+          >
+            Migration history
+          </Link>
+        </nav>
+      )}
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <div className="flex items-center gap-2 text-xs text-slate-500">
