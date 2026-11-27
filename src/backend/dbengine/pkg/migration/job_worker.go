@@ -400,6 +400,30 @@ func (jc *JobCoordinator) processMessage(ctx context.Context, workerID string, m
 		jc.metrics.JobEntered(string(StatusRunning))
 	}
 
+	revalCtx, revalSpan := telemetry.StartSpan(ctx, "worker.revalidate",
+		attribute.Int64("database.id", job.DatabaseID),
+		attribute.Int64("migration.id", job.MigrationID),
+		attribute.Int64("job.id", job.ID),
+		attribute.String("action", string(job.Action)),
+	)
+	revalErr := jc.repo.RevalidateJobBeforeExecute(revalCtx, job)
+	telemetry.EndSpan(revalSpan, revalErr)
+	if revalErr != nil {
+		if jc.metrics != nil {
+			jc.metrics.JobLeft(string(StatusRunning))
+			jc.metrics.JobEntered(string(StatusFailed))
+			jc.metrics.JobFinished(string(StatusFailed))
+		}
+		progress := BatchProgress{
+			CommittedBatches: job.CommittedBatches,
+			CommittedRows:    job.CommittedRows,
+			LastCursor:       job.LastCursor,
+		}
+		_ = jc.repo.FinalizeJobExecution(context.WithoutCancel(ctx), job, StatusFailed, progress, 0, revalErr.Error())
+		_ = jc.lockManager.FinishOrHoldLock(context.WithoutCancel(ctx), job.DatabaseID, job.ID, StatusFailed)
+		return nil
+	}
+
 	job, err = jc.repo.MarkJobRunning(ctx, job.DatabaseID, job.ID)
 	if err != nil {
 		if jc.metrics != nil {
@@ -507,10 +531,12 @@ func (jc *JobCoordinator) executeJobSQL(ctx context.Context, job *Job) (BatchPro
 		return jc.executor.RunBatch(ctx, pool, checkpointJobID, job.SQLSnapshot, job.BatchColumn, job.BatchSize, onProgress)
 	}
 
-	if err := jc.executor.Run(ctx, pool, job.SQLSnapshot); err != nil {
+	rowsAffected, err := jc.executor.RunWithRows(ctx, pool, job.SQLSnapshot)
+	if err != nil {
 		return progress, StatusFailed, err
 	}
 	progress.CommittedBatches = 1
+	progress.CommittedRows = rowsAffected
 	if jc.metrics != nil {
 		jc.metrics.BatchCommitted(string(job.Action), progress.CommittedRows)
 	}

@@ -112,6 +112,76 @@ func (r *PGRepository) MarkJobRunning(ctx context.Context, databaseID, jobID int
 	return r.GetJob(ctx, databaseID, jobID)
 }
 
+func (r *PGRepository) RevalidateJobBeforeExecute(ctx context.Context, job *Job) error {
+	var version int
+	var activeState, migStatus string
+	var isIrreversible bool
+	err := r.db.QueryRow(ctx, `
+		SELECT version, active_state, status, is_irreversible
+		FROM migrations
+		WHERE id = $1 AND database_id = $2`,
+		job.MigrationID, job.DatabaseID,
+	).Scan(&version, &activeState, &migStatus, &isIrreversible)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return apperr.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	switch job.Action {
+	case JobActionApply:
+		var hasBlockingPrior bool
+		if err := r.db.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM migrations p
+				WHERE p.database_id = $1
+				  AND p.version < $2
+				  AND (
+				      p.active_state IN ('partial', 'partially_reverted')
+				      OR (p.active_state = 'not_applied' AND p.status <> 'failed')
+				  )
+			)`, job.DatabaseID, version).Scan(&hasBlockingPrior); err != nil {
+			return err
+		}
+		if hasBlockingPrior {
+			return fmt.Errorf("%w: revalidasi gagal, terdapat migration versi sebelumnya yang belum dieksekusi atau masih partial", apperr.ErrNotExecutable)
+		}
+	case JobActionRollback:
+		if isIrreversible {
+			return fmt.Errorf("%w: revalidasi gagal, migration bersifat irreversible", apperr.ErrNotExecutable)
+		}
+		if ActiveState(activeState) != ActiveStateApplied {
+			return fmt.Errorf("%w: revalidasi gagal, migration sudah tidak dalam kondisi applied", apperr.ErrNotExecutable)
+		}
+		var laterApplied bool
+		if err := r.db.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM migrations
+				WHERE database_id = $1 AND version > $2
+				  AND active_state IN ('applied', 'partial', 'partially_reverted')
+			)`, job.DatabaseID, version).Scan(&laterApplied); err != nil {
+			return err
+		}
+		if laterApplied {
+			return fmt.Errorf("%w: revalidasi gagal, terdapat migration versi lebih baru yang masih applied", apperr.ErrNotExecutable)
+		}
+	case JobActionForward:
+		var earlierRolledBack bool
+		if err := r.db.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM migrations
+				WHERE database_id = $1 AND version < $2 AND active_state = 'rolled_back'
+			)`, job.DatabaseID, version).Scan(&earlierRolledBack); err != nil {
+			return err
+		}
+		if earlierRolledBack {
+			return fmt.Errorf("%w: revalidasi gagal, terdapat migration versi lebih awal yang masih rolled_back", apperr.ErrNotExecutable)
+		}
+	}
+	return nil
+}
+
 func (r *PGRepository) UpdateJobBatchProgress(ctx context.Context, jobID int64, progress BatchProgress) error {
 	_, err := r.db.Exec(ctx, `
 		UPDATE migration_jobs

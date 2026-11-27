@@ -17,9 +17,14 @@ type SQLRunner interface {
 
 type Executor struct{ StatementTimeout time.Duration }
 
-func (e *Executor) Run(ctx context.Context, pool *pgxpool.Pool, sql string) (runErr error) {
+func (e *Executor) Run(ctx context.Context, pool *pgxpool.Pool, sql string) error {
+	_, err := e.RunWithRows(ctx, pool, sql)
+	return err
+}
+
+func (e *Executor) RunWithRows(ctx context.Context, pool *pgxpool.Pool, sql string) (rowsAffected int64, runErr error) {
 	if e.StatementTimeout <= 0 {
-		return fmt.Errorf("migration statement timeout must be positive")
+		return 0, fmt.Errorf("migration statement timeout must be positive")
 	}
 	ctx, span := telemetry.StartSpan(ctx, "db.query")
 	defer func() { telemetry.EndSpan(span, runErr) }()
@@ -33,14 +38,14 @@ func (e *Executor) Run(ctx context.Context, pool *pgxpool.Pool, sql string) (run
 	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return dbtarget.ClassifyError(err)
+		return 0, dbtarget.ClassifyError(err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", timeoutMs)); err != nil {
-		return dbtarget.ClassifyError(err)
+		return 0, dbtarget.ClassifyError(err)
 	}
 	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '5s'"); err != nil {
-		return dbtarget.ClassifyError(err)
+		return 0, dbtarget.ClassifyError(err)
 	}
 
 	ev := telemetry.SQLEvent{
@@ -56,9 +61,10 @@ func (e *Executor) Run(ctx context.Context, pool *pgxpool.Pool, sql string) (run
 		ev.Err = execErr
 		telemetry.SQLResult(ctx, ev)
 		telemetry.SQLRollback(ctx, ev)
-		return execErr
+		return 0, execErr
 	}
-	ev.RowCount = tag.RowsAffected()
+	rowsAffected = tag.RowsAffected()
+	ev.RowCount = rowsAffected
 	telemetry.SQLResult(ctx, ev)
 
 	commitStart := time.Now()
@@ -66,5 +72,5 @@ func (e *Executor) Run(ctx context.Context, pool *pgxpool.Pool, sql string) (run
 	ev.Duration = time.Since(commitStart)
 	ev.Err = commitErr
 	telemetry.SQLCommit(ctx, ev)
-	return commitErr
+	return rowsAffected, commitErr
 }
