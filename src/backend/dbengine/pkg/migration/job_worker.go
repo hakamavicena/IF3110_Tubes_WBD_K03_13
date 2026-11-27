@@ -22,9 +22,14 @@ type JobCoordinator struct {
 	pools             ports.PoolProvider
 	executor          *Executor
 	authz             ports.Authorizer
+	metrics           *telemetry.Metrics
 	execTimeout       time.Duration
 	heartbeatInterval time.Duration
 	requeueDelay      time.Duration
+}
+
+func (jc *JobCoordinator) SetMetrics(m *telemetry.Metrics) {
+	jc.metrics = m
 }
 
 func NewJobCoordinator(
@@ -82,6 +87,16 @@ func (jc *JobCoordinator) EnqueueJob(ctx context.Context, userID, databaseID, jo
 	if err := jc.queue.Publish(ctx, msg); err != nil {
 		return nil, fmt.Errorf("gagal mengirim job ke antrean: %w", err)
 	}
+	if jc.metrics != nil {
+		jc.metrics.JobEntered(string(StatusPendingQueue))
+	}
+	slog.InfoContext(ctx, "job dimasukkan ke antrean",
+		"event", "job.enqueue",
+		"status", string(job.Status),
+		"database_id", databaseID,
+		"job_id", job.ID,
+		"action", string(job.Action),
+	)
 	return job, nil
 }
 
@@ -346,9 +361,19 @@ func (jc *JobCoordinator) processMessage(ctx context.Context, workerID string, m
 		return nil
 	}
 
-	acquired, err := jc.lockManager.AcquireLock(ctx, job.DatabaseID, job.ID, workerID, job.Action)
+	lockStart := time.Now()
+	lockCtx, lockSpan := telemetry.StartSpan(ctx, "lock.acquire",
+		attribute.Int64("database.id", job.DatabaseID),
+		attribute.Int64("job.id", job.ID),
+		attribute.String("worker.id", workerID),
+	)
+	acquired, err := jc.lockManager.AcquireLock(lockCtx, job.DatabaseID, job.ID, workerID, job.Action)
+	telemetry.EndSpan(lockSpan, err)
 	if err != nil {
 		if errors.Is(err, ErrDatabaseLocked) {
+			if jc.metrics != nil {
+				jc.metrics.JobRetried("lock_busy")
+			}
 			if jc.requeueDelay > 0 {
 				select {
 				case <-ctx.Done():
@@ -364,8 +389,22 @@ func (jc *JobCoordinator) processMessage(ctx context.Context, workerID string, m
 		return jc.queue.Publish(ctx, msg)
 	}
 
+	if jc.metrics != nil {
+		jc.metrics.ObserveLockWait(time.Since(lockStart))
+		if job.QueuedAt != nil {
+			jc.metrics.ObserveQueueWait(time.Since(*job.QueuedAt))
+		} else if !msg.EnqueuedAt.IsZero() {
+			jc.metrics.ObserveQueueWait(time.Since(msg.EnqueuedAt))
+		}
+		jc.metrics.JobLeft(string(StatusPendingQueue))
+		jc.metrics.JobEntered(string(StatusRunning))
+	}
+
 	job, err = jc.repo.MarkJobRunning(ctx, job.DatabaseID, job.ID)
 	if err != nil {
+		if jc.metrics != nil {
+			jc.metrics.JobLeft(string(StatusRunning))
+		}
 		_ = jc.lockManager.FinishOrHoldLock(ctx, msg.DatabaseID, msg.JobID, StatusFailed)
 		return err
 	}
@@ -379,15 +418,39 @@ func (jc *JobCoordinator) processMessage(ctx context.Context, workerID string, m
 
 	start := time.Now()
 	progress, finalStatus, runErr := jc.executeJobSQL(runCtx, job)
-	durationMs := int(time.Since(start).Milliseconds())
+	execDuration := time.Since(start)
+	durationMs := int(execDuration.Milliseconds())
+
+	if jc.metrics != nil {
+		jc.metrics.JobLeft(string(StatusRunning))
+		jc.metrics.JobEntered(string(finalStatus))
+		jc.metrics.JobFinished(string(finalStatus))
+		jc.metrics.ObserveMigration(string(job.ExecutionMode), string(job.Action), execDuration)
+	}
 
 	errMsg := ""
 	if runErr != nil {
 		errMsg = describeError(runErr)
 	}
 
+	slog.InfoContext(ctx, "eksekusi job selesai",
+		"event", "job.finish",
+		"status", string(finalStatus),
+		"database_id", job.DatabaseID,
+		"migration_id", job.MigrationID,
+		"job_id", job.ID,
+		"action", string(job.Action),
+		"mode", string(job.ExecutionMode),
+		"committed_batches", progress.CommittedBatches,
+		"committed_rows", progress.CommittedRows,
+		"duration_ms", durationMs,
+	)
+
 	finalizeCtx := context.WithoutCancel(ctx)
 	if err := jc.repo.FinalizeJobExecution(finalizeCtx, job, finalStatus, progress, durationMs, errMsg); err != nil {
+		if jc.metrics != nil {
+			jc.metrics.JobRetried("uncertain_commit")
+		}
 		_ = jc.lockManager.MarkUncertain(finalizeCtx, job.DatabaseID, job.ID)
 		return err
 	}
@@ -425,7 +488,16 @@ func (jc *JobCoordinator) executeJobSQL(ctx context.Context, job *Job) (BatchPro
 		if err != nil {
 			return progress, StatusFailed, err
 		}
+		prevRows := progress.CommittedRows
 		onProgress := func(pCtx context.Context, bp BatchProgress) error {
+			delta := bp.CommittedRows - prevRows
+			if delta < 0 {
+				delta = 0
+			}
+			prevRows = bp.CommittedRows
+			if jc.metrics != nil {
+				jc.metrics.BatchCommitted(string(job.Action), delta)
+			}
 			return jc.repo.UpdateJobBatchProgress(pCtx, job.ID, bp)
 		}
 
@@ -439,5 +511,8 @@ func (jc *JobCoordinator) executeJobSQL(ctx context.Context, job *Job) (BatchPro
 		return progress, StatusFailed, err
 	}
 	progress.CommittedBatches = 1
+	if jc.metrics != nil {
+		jc.metrics.BatchCommitted(string(job.Action), progress.CommittedRows)
+	}
 	return progress, StatusSuccess, nil
 }

@@ -10,7 +10,10 @@ import (
 	"backend/dbengine/pkg/apperr"
 	"backend/dbengine/pkg/dbtarget"
 	"backend/dbengine/pkg/ports"
+	"backend/dbengine/pkg/telemetry"
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"time"
 )
 
 const (
@@ -42,10 +45,13 @@ func (s *Service) authorize(ctx context.Context, userID, dbID int64) error {
 	return nil
 }
 
-func (s *Service) withReadTx(ctx context.Context, userID, dbID int64, fn func(pgx.Tx) error) error {
+func (s *Service) withReadTx(ctx context.Context, userID, dbID int64, fn func(pgx.Tx) error) (retErr error) {
 	if err := s.authorize(ctx, userID, dbID); err != nil {
 		return err
 	}
+	ctx, span := telemetry.StartSpan(ctx, "db.viewer.read", attribute.Int64("database.id", dbID))
+	defer func() { telemetry.EndSpan(span, retErr) }()
+
 	pool, err := s.pools.Pool(ctx, dbID)
 	if err != nil {
 		return err
@@ -58,7 +64,19 @@ func (s *Service) withReadTx(ctx context.Context, userID, dbID int64, fn func(pg
 	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '"+viewTimeout+"'"); err != nil {
 		return dbtarget.ClassifyError(err)
 	}
-	return dbtarget.ClassifyError(fn(tx))
+	ev := telemetry.SQLEvent{
+		Database: fmt.Sprintf("target:%d", dbID),
+		Query:    "READONLY_INTROSPECTION",
+		ReadOnly: true,
+		RowCount: -1,
+	}
+	telemetry.SQLStart(ctx, ev)
+	t0 := time.Now()
+	err = dbtarget.ClassifyError(fn(tx))
+	ev.Duration = time.Since(t0)
+	ev.Err = err
+	telemetry.SQLResult(ctx, ev)
+	return err
 }
 
 func (s *Service) ListSchemas(ctx context.Context, userID, dbID int64) ([]string, error) {

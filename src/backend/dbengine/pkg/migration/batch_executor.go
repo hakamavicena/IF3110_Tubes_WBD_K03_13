@@ -11,8 +11,10 @@ import (
 
 	"backend/dbengine/pkg/apperr"
 	"backend/dbengine/pkg/dbtarget"
+	"backend/dbengine/pkg/telemetry"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type BatchProgress struct {
@@ -301,7 +303,13 @@ func executeSingleBatchTx(
 	scopedSQL string,
 	startCursor string,
 	endCursor string,
-) (int64, error) {
+) (rowsOut int64, retErr error) {
+	ctx, span := telemetry.StartSpan(ctx, "db.batch",
+		attribute.Int64("job.id", checkpointJobID),
+		attribute.Int("batch.number", batchNum),
+	)
+	defer func() { telemetry.EndSpan(span, retErr) }()
+
 	tx, err := targetPool.Begin(ctx)
 	if err != nil {
 		return 0, dbtarget.ClassifyError(err)
@@ -329,11 +337,28 @@ func executeSingleBatchTx(
 		return 0, err
 	}
 
-	tag, err := tx.Exec(ctx, scopedSQL, parseCursorParam(startCursor), parseCursorParam(endCursor))
+	params := []any{parseCursorParam(startCursor), parseCursorParam(endCursor)}
+	ev := telemetry.SQLEvent{
+		Database: "target",
+		Query:    scopedSQL,
+		Params:   params,
+		JobID:    checkpointJobID,
+		Batch:    batchNum,
+		RowCount: -1,
+	}
+	telemetry.SQLStart(ctx, ev)
+	t0 := time.Now()
+	tag, err := tx.Exec(ctx, scopedSQL, params...)
+	ev.Duration = time.Since(t0)
 	if err != nil {
+		ev.Err = err
+		telemetry.SQLResult(ctx, ev)
+		telemetry.SQLRollback(ctx, ev)
 		return 0, err
 	}
 	rowsAffected := tag.RowsAffected()
+	ev.RowCount = rowsAffected
+	telemetry.SQLResult(ctx, ev)
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO _platform_batch_checkpoints (
@@ -348,12 +373,20 @@ func executeSingleBatchTx(
 		checkpointJobID, batchNum, startCursor, endCursor, rowsAffected,
 	)
 	if err != nil {
+		ev.Err = err
+		telemetry.SQLRollback(ctx, ev)
 		return 0, err
 	}
 
+	commitStart := time.Now()
 	if err := tx.Commit(ctx); err != nil {
+		ev.Duration = time.Since(commitStart)
+		ev.Err = err
+		telemetry.SQLCommit(ctx, ev)
 		return 0, err
 	}
+	ev.Duration = time.Since(commitStart)
+	telemetry.SQLCommit(ctx, ev)
 	return rowsAffected, nil
 }
 
@@ -366,7 +399,13 @@ func revertSingleBatchTx(
 	scopedSQLDown string,
 	startCursor string,
 	endCursor string,
-) (int64, error) {
+) (rowsOut int64, retErr error) {
+	ctx, span := telemetry.StartSpan(ctx, "db.batch.revert",
+		attribute.Int64("job.id", checkpointJobID),
+		attribute.Int("batch.number", batchNum),
+	)
+	defer func() { telemetry.EndSpan(span, retErr) }()
+
 	tx, err := targetPool.Begin(ctx)
 	if err != nil {
 		return 0, dbtarget.ClassifyError(err)
@@ -380,10 +419,27 @@ func revertSingleBatchTx(
 		return 0, dbtarget.ClassifyError(err)
 	}
 
-	tag, err := tx.Exec(ctx, scopedSQLDown, parseCursorParam(startCursor), parseCursorParam(endCursor))
+	params := []any{parseCursorParam(startCursor), parseCursorParam(endCursor)}
+	ev := telemetry.SQLEvent{
+		Database: "target",
+		Query:    scopedSQLDown,
+		Params:   params,
+		JobID:    checkpointJobID,
+		Batch:    batchNum,
+		RowCount: -1,
+	}
+	telemetry.SQLStart(ctx, ev)
+	t0 := time.Now()
+	tag, err := tx.Exec(ctx, scopedSQLDown, params...)
+	ev.Duration = time.Since(t0)
 	if err != nil {
+		ev.Err = err
+		telemetry.SQLResult(ctx, ev)
+		telemetry.SQLRollback(ctx, ev)
 		return 0, err
 	}
+	ev.RowCount = tag.RowsAffected()
+	telemetry.SQLResult(ctx, ev)
 
 	updateTag, err := tx.Exec(ctx, `
 		UPDATE _platform_batch_checkpoints
@@ -392,15 +448,23 @@ func revertSingleBatchTx(
 		checkpointJobID, batchNum,
 	)
 	if err != nil {
+		ev.Err = err
+		telemetry.SQLRollback(ctx, ev)
 		return 0, err
 	}
 	if updateTag.RowsAffected() == 0 {
 		return 0, fmt.Errorf("checkpoint job %d batch %d sudah di-revert sebelumnya", checkpointJobID, batchNum)
 	}
 
+	commitStart := time.Now()
 	if err := tx.Commit(ctx); err != nil {
+		ev.Duration = time.Since(commitStart)
+		ev.Err = err
+		telemetry.SQLCommit(ctx, ev)
 		return 0, err
 	}
+	ev.Duration = time.Since(commitStart)
+	telemetry.SQLCommit(ctx, ev)
 	return tag.RowsAffected(), nil
 }
 

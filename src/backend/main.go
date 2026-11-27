@@ -181,6 +181,7 @@ func main() {
 
 	lockManager := migration.NewLockManager(pgxPool)
 	jobCoordinator := migration.NewJobCoordinator(migRepo, lockManager, jobQueue, targetManager, migExecutor, authorizer, timeout)
+	jobCoordinator.SetMetrics(metrics)
 
 	// Pemulihan hanya menyentuh job yang lock-nya basi (heartbeat lewat batas).
 	// Job milik instance lain yang masih hidup tidak disentuh.
